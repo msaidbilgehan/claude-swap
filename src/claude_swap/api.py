@@ -38,6 +38,7 @@ from typing import Any, NamedTuple
 
 from claude_swap.autoswitch import (
     AllExhaustedEvent,
+    AutoSwitcherInstance,
     AutoSwitchEngine,
     AutoSwitchEvent,
     ConfigWarningEvent,
@@ -48,7 +49,9 @@ from claude_swap.autoswitch import (
     SleepEvent,
     SwitchEvent,
     UnquarantineEvent,
+    running_instances,
 )
+from claude_swap.credentials import CLAUDE_CODE_KEYCHAIN_SERVICE
 from claude_swap.exceptions import (
     AccountNotFoundError,
     ClaudeSwitchError,
@@ -60,7 +63,14 @@ from claude_swap.exceptions import (
     ValidationError,
 )
 from claude_swap.json_output import SCHEMA_VERSION
+from claude_swap.models import Platform
+from claude_swap.oauth import credential_fingerprint
 from claude_swap.paths import get_claude_config_home, get_default_claude_config_home
+from claude_swap.session import (
+    AUTH_OVERRIDE_ENV_VARS,
+    SessionManager,
+    read_config_dir_credentials,
+)
 from claude_swap.settings import AutoSwitchSettings, load_settings
 from claude_swap.switcher import ClaudeAccountSwitcher
 
@@ -71,6 +81,7 @@ __all__ = [
     "AutoSwitchEngine",
     "AutoSwitchEvent",
     "AutoSwitchSettings",
+    "AutoSwitcherInstance",
     "ClaudeAccountSwitcher",
     "ClaudeSwitchError",
     "ConfigError",
@@ -83,6 +94,8 @@ __all__ = [
     "ProjectAccount",
     "QuarantineEvent",
     "SessionError",
+    "SessionProfile",
+    "SharedGrant",
     "SleepEvent",
     "SwitchError",
     "SwitchEvent",
@@ -94,8 +107,11 @@ __all__ = [
     "inject_system_trust",
     "live_session_accounts",
     "open_switcher",
+    "prepare_session_profile",
     "project_account",
+    "running_autoswitchers",
     "set_rotation",
+    "shared_grants",
     "switch_to",
     "version",
 ]
@@ -113,6 +129,34 @@ class ProjectAccount(NamedTuple):
 
     slot: str | None
     email: str | None
+
+
+class SessionProfile(NamedTuple):
+    """A ready session-mode profile (``cswap run``) for one account.
+
+    Launch Claude Code with ``CLAUDE_CONFIG_DIR`` set to ``config_dir``
+    exactly as given (the macOS Keychain item name is hashed from that string)
+    and with every variable in ``strip_env`` removed from the environment,
+    because each of them would override the profile's login.
+    """
+
+    config_dir: str
+    slot: str
+    email: str
+    strip_env: tuple[str, ...]
+
+
+class SharedGrant(NamedTuple):
+    """A managed account whose stored login is the login of a Claude profile.
+
+    Two copies of one OAuth grant drift apart when either side refreshes, so
+    such an account must not also be used through claude-swap. Carries no
+    token material.
+    """
+
+    slot: str
+    email: str
+    directory: str
 
 
 @contextlib.contextmanager
@@ -275,3 +319,105 @@ def inject_system_trust() -> bool:
         _logger.debug("api: truststore injection failed", exc_info=True)
         return False
     return True
+
+
+def prepare_session_profile(
+    switcher: ClaudeAccountSwitcher, identifier: str, *, share_history: bool = True
+) -> SessionProfile:
+    """Create or refresh the session-mode profile of ``identifier``.
+
+    Adds the guard ``cswap run`` applies and ``SessionManager.setup_session``
+    alone lacks: the account that is the active default login is refused
+    (:class:`SessionError`), because a second copy of a live credential drifts
+    when either copy refreshes. API-key accounts are refused too.
+    ``share_history`` shares conversation history with the default profile
+    (POSIX only). Settings and MCP servers are always shared, as with
+    ``cswap run``. May run ``claude auth status`` and refresh a token.
+    """
+    _refuse_foreign_profile()
+    if share_history and switcher.platform == Platform.WINDOWS:
+        raise SessionError("share_history is not supported on Windows")
+    with _quiet():
+        account_num, email, org_uuid = switcher.resolve_account(identifier)
+        current = switcher._get_current_account()
+        if current is not None and current == (email, org_uuid):
+            raise SessionError(
+                f"Account-{account_num} ({email}) is the active default login; "
+                "a session profile would hold a second copy of its live "
+                "credential. Switch the default login to another account first."
+            )
+        session_dir, slot, slot_email = SessionManager(switcher).setup_session(
+            identifier, True, share_history
+        )
+    return SessionProfile(
+        config_dir=str(session_dir),
+        slot=str(slot),
+        email=slot_email,
+        strip_env=tuple(AUTH_OVERRIDE_ENV_VARS),
+    )
+
+
+def running_autoswitchers(
+    switcher: ClaudeAccountSwitcher,
+) -> list[AutoSwitcherInstance]:
+    """Auto-switch engines running against this account store, oldest first.
+
+    Every engine records itself while its loop runs (``cswap auto``, the menu
+    bar, an embedding program). Records of processes that are gone are pruned.
+    """
+    with _quiet():
+        return running_instances(switcher.backup_dir)
+
+
+def _profile_keychain_override(directory: str) -> str | None:
+    """The unsuffixed Keychain item for the default profile, else ``None``."""
+    try:
+        if Path(directory).resolve() == get_default_claude_config_home().resolve():
+            return CLAUDE_CODE_KEYCHAIN_SERVICE
+    except OSError:
+        return None
+    return None
+
+
+def shared_grants(
+    switcher: ClaudeAccountSwitcher,
+    profile_dirs: Collection[str | os.PathLike[str]],
+) -> list[SharedGrant]:
+    """Managed accounts whose stored login is the login of one of ``profile_dirs``.
+
+    Each directory is read the way Claude Code reads a ``CLAUDE_CONFIG_DIR``
+    profile: on macOS the Keychain item named from the directory string (the
+    unsuffixed item for the default profile), elsewhere its
+    ``.credentials.json``. Logins compare by credential fingerprint (the
+    refresh-token hash), so an access-token rotation still matches. Missing or
+    logged-out directories match nothing. Results carry no token material.
+    """
+    with _quiet():
+        logins: list[tuple[str, str]] = []
+        for raw in profile_dirs:
+            directory = os.path.expanduser(os.fspath(raw))
+            creds = read_config_dir_credentials(
+                directory, keychain_service=_profile_keychain_override(directory)
+            )
+            fingerprint = credential_fingerprint(creds or "")
+            if fingerprint is not None:
+                logins.append((directory, fingerprint))
+        if not logins:
+            return []
+        data = switcher._get_sequence_data() or {}
+        grants: list[SharedGrant] = []
+        for num, record in sorted(
+            data.get("accounts", {}).items(), key=lambda item: int(item[0])
+        ):
+            email = record.get("email", "")
+            stored = credential_fingerprint(
+                switcher.read_account_credentials(str(num), email)
+            )
+            if stored is None:
+                continue
+            for directory, fingerprint in logins:
+                if fingerprint == stored:
+                    grants.append(
+                        SharedGrant(slot=str(num), email=email, directory=directory)
+                    )
+    return grants

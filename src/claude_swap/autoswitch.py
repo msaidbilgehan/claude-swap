@@ -33,7 +33,9 @@ import enum
 import json
 import logging
 import math
+import os
 import random
+import sys
 import threading
 import time
 from collections.abc import Callable, Sequence
@@ -46,6 +48,11 @@ from claude_swap import oauth, poll_policy
 from claude_swap.exceptions import ClaudeSwitchError
 from claude_swap.json_output import SCHEMA_VERSION, USAGE_TOKEN_EXPIRED
 from claude_swap.locking import FileLock
+from claude_swap.process_detection import (
+    is_pid_alive,
+    process_start_ticks,
+    process_started_at,
+)
 from claude_swap.poll_policy import (
     ESCALATION_MARGIN_PCT,
     RESET_SLACK_S,
@@ -491,6 +498,140 @@ class ConfigWarningEvent(AutoSwitchEvent):
         return f"warning: {self.message}"
 
 
+
+# ---------------------------------------------------------------------------
+# Instance registry
+# ---------------------------------------------------------------------------
+
+# Every looping engine records itself here while it runs, so another program
+# (a second `cswap auto`, the menu bar, an embedding daemon) can tell that an
+# auto-switcher is already active on this account store. Informational, not a
+# lock: two engines still run if started, they just no longer run unseen.
+REGISTRY_DIRNAME = "autoswitch"
+INSTANCES_DIRNAME = "instances"
+INSTANCE_SCHEMA_VERSION = 1
+
+_registry_logger = logging.getLogger("claude-swap")
+
+
+def instances_dir(backup_root: Path) -> Path:
+    """``<backup_root>/autoswitch/instances``: one ``<pid>.json`` per engine."""
+    return backup_root / REGISTRY_DIRNAME / INSTANCES_DIRNAME
+
+
+def _default_host_app() -> str:
+    name = Path(sys.argv[0]).name if sys.argv and sys.argv[0] else ""
+    return name or "python"
+
+
+def _own_process_stamp(pid: int) -> dict:
+    """Start-time stamp that tells this process from a later one at the same pid."""
+    ticks = process_start_ticks(pid)
+    if ticks is not None:
+        return {"procStartTicks": ticks}
+    started = process_started_at(pid)
+    return {"procStartedAt": started} if started is not None else {}
+
+
+def _stamp_matches(pid: int, record: dict) -> bool:
+    """Whether ``pid`` still belongs to the process that wrote ``record``.
+
+    Unknowable answers count as a match, like claude's own session records:
+    not being able to tell must not hide a live engine.
+    """
+    ticks = record.get("procStartTicks")
+    if isinstance(ticks, str) and ticks:
+        current = process_start_ticks(pid)
+        return current is None or current == ticks
+    started = record.get("procStartedAt")
+    if isinstance(started, int):
+        current_started = process_started_at(pid)
+        return current_started is None or abs(current_started - started) <= 1
+    return True
+
+
+@dataclass(frozen=True)
+class AutoSwitcherInstance:
+    """One running auto-switch engine, as recorded in the registry."""
+
+    pid: int
+    host_app: str
+    started_at: str
+    dry_run: bool
+
+
+def register_instance(
+    backup_root: Path, *, host_app: str, dry_run: bool, token: str
+) -> Path:
+    """Record the calling process's engine; returns the registry file."""
+    pid = os.getpid()
+    path = instances_dir(backup_root) / f"{pid}.json"
+    path.parent.mkdir(parents=True, exist_ok=True)
+    for directory in (path.parent.parent, path.parent):
+        directory.chmod(0o700)
+    atomic_write_json(
+        path,
+        {
+            "schemaVersion": INSTANCE_SCHEMA_VERSION,
+            "pid": pid,
+            "hostApp": host_app,
+            "startedAt": _now_iso(),
+            "dryRun": dry_run,
+            "token": token,
+            **_own_process_stamp(pid),
+        },
+    )
+    return path
+
+
+def unregister_instance(path: Path, token: str) -> None:
+    """Remove a registry file, unless a newer engine in this process replaced it."""
+    try:
+        record = json.loads(path.read_text(encoding="utf-8"))
+    except FileNotFoundError:
+        return
+    except (OSError, ValueError):
+        record = {}
+    if isinstance(record, dict) and record.get("token") not in (None, token):
+        return
+    path.unlink(missing_ok=True)
+
+
+def running_instances(backup_root: Path) -> list[AutoSwitcherInstance]:
+    """Live registered engines, oldest first; prunes records of dead processes."""
+    directory = instances_dir(backup_root)
+    if not directory.is_dir():
+        return []
+    live: list[AutoSwitcherInstance] = []
+    for path in sorted(directory.glob("*.json")):
+        try:
+            record = json.loads(path.read_text(encoding="utf-8"))
+            pid = record["pid"]
+            if not isinstance(pid, int) or isinstance(pid, bool):
+                raise TypeError(f"pid is {type(pid).__name__}")
+            instance = AutoSwitcherInstance(
+                pid=pid,
+                host_app=str(record.get("hostApp", "")),
+                started_at=str(record.get("startedAt", "")),
+                dry_run=bool(record.get("dryRun", False)),
+            )
+        except FileNotFoundError:
+            continue  # removed by its engine while we were reading
+        except (OSError, ValueError, KeyError, TypeError) as e:
+            _registry_logger.warning(
+                "Ignoring unreadable auto-switch registry entry %s: %s", path, e
+            )
+            continue
+        if is_pid_alive(pid) and _stamp_matches(pid, record):
+            live.append(instance)
+            continue
+        try:
+            path.unlink(missing_ok=True)
+        except OSError as e:
+            _registry_logger.warning("Could not prune %s: %s", path, e)
+    live.sort(key=lambda inst: (inst.started_at, inst.pid))
+    return live
+
 # ---------------------------------------------------------------------------
 # Engine
 # ---------------------------------------------------------------------------
@@ -647,8 +788,11 @@ class AutoSwitchEngine:
         dry_run: bool = False,
         state_path: Path | None = None,
         clock: Callable[[], float] = time.time,
+        host_app: str | None = None,
     ):
         self.switcher = switcher
+        # Recorded in the instance registry while run_loop() runs.
+        self.host_app = host_app or _default_host_app()
         self.settings = settings
         # Model(s) whose per-model weekly limit also binds the switch decision
         # (empty = account-wide 5h/7d only). ``settings.model`` is a comma-
@@ -2335,7 +2479,35 @@ class AutoSwitchEngine:
             return delay
 
     def run_loop(self) -> int:
-        """Tick forever (until :meth:`stop`); a failing tick never kills it."""
+        """Tick forever (until :meth:`stop`); a failing tick never kills it.
+
+        While the loop runs, the engine is listed in the instance registry
+        (:func:`running_instances`). Registry failures are logged and never
+        stop the engine.
+        """
+        token = f"{os.getpid()}-{id(self)}-{time.time_ns()}"
+        registered: Path | None = None
+        try:
+            registered = register_instance(
+                self.switcher.backup_dir,
+                host_app=self.host_app,
+                dry_run=self.dry_run,
+                token=token,
+            )
+        except Exception as e:  # noqa: BLE001 - the registry is informational
+            _registry_logger.warning("Could not register auto-switch engine: %s", e)
+        try:
+            return self._run_loop()
+        finally:
+            if registered is not None:
+                try:
+                    unregister_instance(registered, token)
+                except Exception as e:  # noqa: BLE001 - see above
+                    _registry_logger.warning(
+                        "Could not unregister auto-switch engine: %s", e
+                    )
+
+    def _run_loop(self) -> int:
         while True:
             # Clear at the top, not after the wait: a wake() racing a wait
             # timeout is then never lost — the tick right after this clear

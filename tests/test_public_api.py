@@ -30,6 +30,7 @@ EXPECTED_ALL = [
     "AutoSwitchEngine",
     "AutoSwitchEvent",
     "AutoSwitchSettings",
+    "AutoSwitcherInstance",
     "ClaudeAccountSwitcher",
     "ClaudeSwitchError",
     "ConfigError",
@@ -42,6 +43,8 @@ EXPECTED_ALL = [
     "ProjectAccount",
     "QuarantineEvent",
     "SessionError",
+    "SessionProfile",
+    "SharedGrant",
     "SleepEvent",
     "SwitchError",
     "SwitchEvent",
@@ -53,8 +56,11 @@ EXPECTED_ALL = [
     "inject_system_trust",
     "live_session_accounts",
     "open_switcher",
+    "prepare_session_profile",
     "project_account",
+    "running_autoswitchers",
     "set_rotation",
+    "shared_grants",
     "switch_to",
     "version",
 ]
@@ -84,6 +90,17 @@ EXPECTED_SIGNATURES = {
         "(switcher: 'ClaudeAccountSwitcher', "
         "on_event: 'Callable[[AutoSwitchEvent], None]', *, dry_run: 'bool')"
         " -> 'AutoSwitchEngine'"
+    ),
+    "prepare_session_profile": (
+        "(switcher: 'ClaudeAccountSwitcher', identifier: 'str', *, "
+        "share_history: 'bool' = True) -> 'SessionProfile'"
+    ),
+    "running_autoswitchers": (
+        "(switcher: 'ClaudeAccountSwitcher') -> 'list[AutoSwitcherInstance]'"
+    ),
+    "shared_grants": (
+        "(switcher: 'ClaudeAccountSwitcher', "
+        "profile_dirs: 'Collection[str | os.PathLike[str]]') -> 'list[SharedGrant]'"
     ),
     "version": "() -> 'str'",
     "inject_system_trust": "() -> 'bool'",
@@ -401,6 +418,144 @@ def test_event_payload_shapes(event, kind, fields):
     assert payload["event"] == kind
     assert isinstance(payload["ts"], str)
     assert set(payload) == {"schemaVersion", "event", "ts", *fields}
+
+
+class TestPrepareSessionProfile:
+    def test_refuses_the_active_default_login(self, seeded, monkeypatch):
+        from claude_swap.session import SessionManager
+
+        def must_not_run(*_a, **_k):
+            raise AssertionError("setup_session must not run for the active account")
+
+        monkeypatch.setattr(SessionManager, "setup_session", must_not_run)
+        with pytest.raises(api.SessionError, match="active default login"):
+            api.prepare_session_profile(seeded.switcher, "1")
+        with pytest.raises(api.SessionError):
+            api.prepare_session_profile(seeded.switcher, "a@example.com")
+
+    def test_delegates_for_another_account(self, seeded, monkeypatch, capfd):
+        from claude_swap.session import SessionManager, session_dir_for
+
+        calls = []
+        profile = session_dir_for(seeded.switcher.backup_dir, "2", "b@example.com")
+
+        def fake_setup(self, identifier, share, share_history=False):
+            calls.append((identifier, share, share_history))
+            print("Bootstrapping session profile")  # must be captured
+            return profile, "2", "b@example.com"
+
+        monkeypatch.setattr(SessionManager, "setup_session", fake_setup)
+        capfd.readouterr()
+        result = api.prepare_session_profile(seeded.switcher, "2", share_history=False)
+        _assert_silent(capfd)
+        assert calls == [("2", True, False)]
+        assert result == api.SessionProfile(
+            config_dir=str(profile),
+            slot="2",
+            email="b@example.com",
+            strip_env=(
+                "ANTHROPIC_API_KEY",
+                "ANTHROPIC_AUTH_TOKEN",
+                "CLAUDE_CODE_OAUTH_TOKEN",
+                "CLAUDE_CODE_OAUTH_TOKEN_FILE_DESCRIPTOR",
+                "CLAUDE_CODE_API_KEY_FILE_DESCRIPTOR",
+            ),
+        )
+        assert isinstance(result.config_dir, str)
+
+    def test_shares_history_by_default(self, seeded, monkeypatch):
+        from claude_swap.session import SessionManager
+
+        calls = []
+
+        def fake_setup(self, identifier, share, share_history=False):
+            calls.append(share_history)
+            return Path("/x"), "2", "b@example.com"
+
+        monkeypatch.setattr(SessionManager, "setup_session", fake_setup)
+        api.prepare_session_profile(seeded.switcher, "2")
+        assert calls == [True]
+
+    def test_unknown_account(self, seeded):
+        with pytest.raises(api.AccountNotFoundError):
+            api.prepare_session_profile(seeded.switcher, "7")
+
+    def test_refuses_a_foreign_config_dir(self, seeded, monkeypatch, tmp_path):
+        monkeypatch.setenv("CLAUDE_CONFIG_DIR", str(tmp_path))
+        with pytest.raises(api.ConfigError):
+            api.prepare_session_profile(seeded.switcher, "2")
+
+
+class TestRunningAutoswitchers:
+    def test_empty(self, seeded):
+        assert api.running_autoswitchers(seeded.switcher) == []
+
+    def test_lists_a_running_engine(self, seeded, monkeypatch):
+        from claude_swap.autoswitch import TickOutcome
+
+        seen = []
+        engine = api.create_engine(seeded.switcher, lambda _e: None, dry_run=True)
+
+        def tick():
+            seen.extend(api.running_autoswitchers(seeded.switcher))
+            engine.stop()
+            return TickOutcome.NO_ACTION
+
+        monkeypatch.setattr(engine, "tick", tick)
+        monkeypatch.setattr(engine, "_next_delay", lambda _o: 0.0)
+        assert engine.run_loop() == 0
+        assert len(seen) == 1
+        assert seen[0].pid == os.getpid()
+        assert seen[0].dry_run is True
+        assert api.running_autoswitchers(seeded.switcher) == []
+
+
+def _write_login(directory: Path, access: str, refresh: str) -> None:
+    directory.mkdir(parents=True, exist_ok=True)
+    (directory / ".credentials.json").write_text(
+        json.dumps({"claudeAiOauth": {"accessToken": access, "refreshToken": refresh}})
+    )
+
+
+class TestSharedGrants:
+    def test_reports_a_copied_login(self, seeded, temp_home, capfd):
+        work = temp_home / ".claude-work"
+        _write_login(work, access="sk-rotated", refresh="rt-2")
+        capfd.readouterr()
+        grants = api.shared_grants(seeded.switcher, [work])
+        _assert_silent(capfd)
+        assert grants == [
+            api.SharedGrant(slot="2", email="b@example.com", directory=str(work))
+        ]
+        assert set(grants[0]._fields) == {"slot", "email", "directory"}
+
+    def test_unrelated_and_missing_profiles_match_nothing(self, seeded, temp_home):
+        other = temp_home / ".claude-other"
+        _write_login(other, access="sk-x", refresh="rt-someone-else")
+        assert api.shared_grants(seeded.switcher, [other, temp_home / "gone"]) == []
+
+    def test_expands_the_home_directory(self, seeded, temp_home):
+        _write_login(temp_home / ".claude-zeker", access="sk-1b", refresh="rt-1")
+        grants = api.shared_grants(seeded.switcher, ["~/.claude-zeker"])
+        assert grants == [
+            api.SharedGrant(
+                slot="1",
+                email="a@example.com",
+                directory=str(temp_home / ".claude-zeker"),
+            )
+        ]
+
+    def test_several_profiles(self, seeded, temp_home):
+        _write_login(temp_home / "p1", access="a", refresh="rt-1")
+        _write_login(temp_home / "p2", access="b", refresh="rt-2")
+        grants = api.shared_grants(seeded.switcher, [temp_home / "p2", temp_home / "p1"])
+        assert [(g.slot, Path(g.directory).name) for g in grants] == [
+            ("1", "p1"),
+            ("2", "p2"),
+        ]
+
+    def test_no_profiles(self, seeded):
+        assert api.shared_grants(seeded.switcher, []) == []
 
 
 def test_platform_is_forced_to_the_file_backend(seeded):

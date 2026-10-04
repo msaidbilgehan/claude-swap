@@ -373,6 +373,12 @@ engine = api.create_engine(switcher, on_event=print, dry_run=True)  # saved sett
 
 `open_switcher()` refuses to start when `CLAUDE_CONFIG_DIR` names any profile but the default one, because the live store follows that variable. The exported names and signatures are pinned by `tests/test_public_api.py`.
 
+Three helpers add guards the CLI applies in its own flows:
+
+- `prepare_session_profile(switcher, "2")` creates or refreshes the `cswap run` profile of an account and returns the exact `CLAUDE_CONFIG_DIR` string to launch with plus the variables to strip; it refuses the account that is the active default login, since a second copy of a live credential drifts.
+- `running_autoswitchers(switcher)` lists the auto-switch engines running against this store (`cswap auto`, the menu bar, an embedding program). Each engine records itself in `<backup_root>/autoswitch/instances/<pid>.json` while its loop runs; records of dead processes are pruned. The registry is informational, not a lock.
+- `shared_grants(switcher, ["~/.claude-work"])` reports managed accounts whose stored login is the login of one of the given Claude profile directories (compared by refresh-token fingerprint), returning slot, email and directory only.
+
 ### Add an account from a raw token or API key
 
 If you only have a long-lived setup-token (e.g., produced by `claude setup-token`)
