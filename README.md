@@ -353,6 +353,26 @@ Weekly windows (`sevenDay` and per-model `scoped` entries — never `fiveHour`) 
 
 `cswap auto --json` emits an event *stream* instead — one JSON object per line (`{"schemaVersion":1,"event":"switch","ts":…, …}` with kinds like `poll`, `switch`, `no-switch`, `account-quarantined`, `all-exhausted`, `error`). The contract is additive: new kinds and fields may appear, so scripts should ignore unknown ones.
 
+### Python API
+
+Programs that embed claude-swap (for example a long-running daemon) use `claude_swap.api` instead of the internals the CLI is built on. It never prints, never reads stdin (an ambiguous email raises instead of prompting) and lets claude-swap's own exceptions (`ClaudeSwitchError` and subclasses) propagate. Its payloads are the same `schemaVersion: 1` shapes as `--json`.
+
+```python
+from claude_swap import api
+
+switcher = api.open_switcher()          # refuses a non-default CLAUDE_CONFIG_DIR
+payload = api.accounts_json(switcher)   # `cswap list --json`, served from the cache
+api.switch_to(switcher, "2")            # `cswap switch 2 --json`
+api.set_rotation(switcher, "3", enabled=False)  # silent `cswap disable 3`
+api.project_account(switcher, "~/code/app")     # the `cswap map` entry for a path
+api.live_session_accounts(switcher)     # {slot: pids} of live `cswap run` sessions
+
+engine = api.create_engine(switcher, on_event=print, dry_run=True)  # saved settings
+# run engine.run_loop() on its own thread; engine.stop() ends it
+```
+
+`open_switcher()` refuses to start when `CLAUDE_CONFIG_DIR` names any profile but the default one, because the live store follows that variable. The exported names and signatures are pinned by `tests/test_public_api.py`.
+
 ### Add an account from a raw token or API key
 
 If you only have a long-lived setup-token (e.g., produced by `claude setup-token`)
