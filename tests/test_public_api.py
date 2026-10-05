@@ -26,6 +26,7 @@ from tests.test_autoswitch import EngineHarness
 EXPECTED_ALL = [
     "SCHEMA_VERSION",
     "AccountNotFoundError",
+    "AddedAccount",
     "AllExhaustedEvent",
     "AutoSwitchEngine",
     "AutoSwitchEvent",
@@ -41,6 +42,7 @@ EXPECTED_ALL = [
     "NoSwitchEvent",
     "PollEvent",
     "ProjectAccount",
+    "ProjectMapping",
     "QuarantineEvent",
     "SessionError",
     "SessionProfile",
@@ -52,16 +54,22 @@ EXPECTED_ALL = [
     "ValidationError",
     "accounts_json",
     "active_account",
+    "add_current_login",
     "create_engine",
     "inject_system_trust",
     "live_session_accounts",
+    "map_project",
     "open_switcher",
     "prepare_session_profile",
     "project_account",
+    "project_mappings",
+    "remove_account",
     "running_autoswitchers",
+    "set_alias",
     "set_rotation",
     "shared_grants",
     "switch_to",
+    "unmap_project",
     "version",
 ]
 
@@ -101,6 +109,28 @@ EXPECTED_SIGNATURES = {
     "shared_grants": (
         "(switcher: 'ClaudeAccountSwitcher', "
         "profile_dirs: 'Collection[str | os.PathLike[str]]') -> 'list[SharedGrant]'"
+    ),
+    "add_current_login": (
+        "(switcher: 'ClaudeAccountSwitcher', *, alias: 'str | None' = None)"
+        " -> 'AddedAccount'"
+    ),
+    "remove_account": (
+        "(switcher: 'ClaudeAccountSwitcher', identifier: 'str') -> 'tuple[str, str]'"
+    ),
+    "set_alias": (
+        "(switcher: 'ClaudeAccountSwitcher', identifier: 'str', alias: 'str | None')"
+        " -> 'str | None'"
+    ),
+    "map_project": (
+        "(switcher: 'ClaudeAccountSwitcher', path: 'str | os.PathLike[str]', "
+        "identifier: 'str') -> 'ProjectAccount'"
+    ),
+    "unmap_project": (
+        "(switcher: 'ClaudeAccountSwitcher', path: 'str | os.PathLike[str]')"
+        " -> 'bool'"
+    ),
+    "project_mappings": (
+        "(switcher: 'ClaudeAccountSwitcher') -> 'list[ProjectMapping]'"
     ),
     "version": "() -> 'str'",
     "inject_system_trust": "() -> 'bool'",
@@ -561,3 +591,111 @@ class TestSharedGrants:
 def test_platform_is_forced_to_the_file_backend(seeded):
     # The seeded fixtures rely on the Linux file backend, as the engine tests do.
     assert seeded.switcher.platform == Platform.LINUX
+
+
+def _live_login(home: Path, email: str, uuid: str) -> None:
+    (home / ".claude" / ".credentials.json").write_text(json.dumps({
+        "claudeAiOauth": {"accessToken": f"sk-{uuid}", "refreshToken": f"rt-{uuid}"},
+    }))
+    (home / ".claude.json").write_text(json.dumps({
+        "oauthAccount": {"emailAddress": email, "accountUuid": uuid},
+    }))
+
+
+class TestAccountManagement:
+    """The silent, non-interactive account management surface (sak.2)."""
+
+    @pytest.fixture(autouse=True)
+    def _no_network(self, monkeypatch):
+        # Whose token is this? Unknown offline: add_account registers anyway.
+        monkeypatch.setattr(
+            "claude_swap.oauth.fetch_oauth_profile", lambda *_a, **_k: None
+        )
+
+    def test_add_registers_a_new_login_in_the_next_slot(self, seeded, capfd):
+        _live_login(seeded.temp_home, "c@example.com", "uuid-3")
+        capfd.readouterr()
+        added = api.add_current_login(seeded.switcher, alias="work")
+        _assert_silent(capfd)
+        assert added == api.AddedAccount(slot="3", email="c@example.com", created=True)
+        rows = {r["number"]: r for r in api.accounts_json(seeded.switcher)["accounts"]}
+        assert rows[3]["email"] == "c@example.com"
+        assert rows[3].get("alias") == "work"
+
+    def test_add_of_a_managed_login_refreshes_it(self, seeded, capfd):
+        capfd.readouterr()
+        added = api.add_current_login(seeded.switcher)
+        _assert_silent(capfd)
+        assert added == api.AddedAccount(slot="1", email="a@example.com", created=False)
+
+    def test_add_without_a_live_login_raises(self, temp_home, no_stdin):
+        h = EngineHarness(temp_home)
+        with pytest.raises(api.ConfigError):
+            api.add_current_login(h.switcher)
+
+    def test_add_refuses_a_foreign_profile(self, seeded, monkeypatch, tmp_path):
+        monkeypatch.setenv("CLAUDE_CONFIG_DIR", str(tmp_path / "hand-made"))
+        with pytest.raises(api.ConfigError, match="CLAUDE_CONFIG_DIR"):
+            api.add_current_login(seeded.switcher)
+
+    def test_remove_drops_the_account_and_its_mappings(self, seeded, tmp_path, capfd):
+        api.map_project(seeded.switcher, tmp_path, "2")
+        capfd.readouterr()
+        assert api.remove_account(seeded.switcher, "b@example.com") == (
+            "2",
+            "b@example.com",
+        )
+        _assert_silent(capfd)
+        numbers = [r["number"] for r in api.accounts_json(seeded.switcher)["accounts"]]
+        assert numbers == [1]
+        assert api.project_mappings(seeded.switcher) == []
+
+    def test_remove_unknown_raises(self, seeded):
+        with pytest.raises(api.AccountNotFoundError):
+            api.remove_account(seeded.switcher, "9")
+
+    def test_remove_ambiguous_email_raises_instead_of_prompting(self, seeded):
+        data = seeded.switcher._get_sequence_data()
+        data["accounts"]["2"]["email"] = "a@example.com"
+        data["accounts"]["2"]["organizationUuid"] = "org-2"
+        seeded.switcher._write_json(seeded.switcher.sequence_file, data)
+        with pytest.raises(api.ConfigError):
+            api.remove_account(seeded.switcher, "a@example.com")
+
+    def test_set_and_clear_an_alias(self, seeded, capfd):
+        capfd.readouterr()
+        assert api.set_alias(seeded.switcher, "2", "Side") == "side"
+        assert api.set_alias(seeded.switcher, "side", None) is None
+        _assert_silent(capfd)
+        rows = {r["number"]: r for r in api.accounts_json(seeded.switcher)["accounts"]}
+        assert not rows[2].get("alias")
+
+    def test_taken_alias_raises(self, seeded):
+        api.set_alias(seeded.switcher, "1", "main")
+        with pytest.raises(api.ConfigError, match="already used"):
+            api.set_alias(seeded.switcher, "2", "main")
+        with pytest.raises(api.ValidationError):
+            api.set_alias(seeded.switcher, "2", "not an alias!")
+
+    def test_map_list_and_unmap(self, seeded, tmp_path, capfd):
+        project = tmp_path / "api"
+        project.mkdir()
+        capfd.readouterr()
+        assert api.map_project(seeded.switcher, project, "b@example.com") == (
+            api.ProjectAccount(slot="2", email="b@example.com")
+        )
+        assert api.project_account(seeded.switcher, project / "sub").slot == "2"
+        (mapping,) = api.project_mappings(seeded.switcher)
+        assert mapping.slot == "2"
+        assert mapping.email == "b@example.com"
+        assert Path(mapping.path) == project.resolve()
+        assert api.unmap_project(seeded.switcher, project) is True
+        assert api.unmap_project(seeded.switcher, project) is False
+        _assert_silent(capfd)
+        assert api.project_mappings(seeded.switcher) == []
+
+    def test_mapping_to_a_removed_account_has_no_slot(self, seeded, tmp_path):
+        MappingStore(seeded.switcher.backup_dir).set(tmp_path, "gone@example.com", "")
+        (mapping,) = api.project_mappings(seeded.switcher)
+        assert mapping.slot is None
+        assert mapping.email == "gone@example.com"

@@ -77,6 +77,7 @@ from claude_swap.switcher import ClaudeAccountSwitcher
 __all__ = [
     "SCHEMA_VERSION",
     "AccountNotFoundError",
+    "AddedAccount",
     "AllExhaustedEvent",
     "AutoSwitchEngine",
     "AutoSwitchEvent",
@@ -92,6 +93,7 @@ __all__ = [
     "NoSwitchEvent",
     "PollEvent",
     "ProjectAccount",
+    "ProjectMapping",
     "QuarantineEvent",
     "SessionError",
     "SessionProfile",
@@ -103,21 +105,48 @@ __all__ = [
     "ValidationError",
     "accounts_json",
     "active_account",
+    "add_current_login",
     "create_engine",
     "inject_system_trust",
     "live_session_accounts",
+    "map_project",
     "open_switcher",
     "prepare_session_profile",
     "project_account",
+    "project_mappings",
+    "remove_account",
     "running_autoswitchers",
+    "set_alias",
     "set_rotation",
     "shared_grants",
     "switch_to",
+    "unmap_project",
     "version",
 ]
 
 _logger = logging.getLogger("claude-swap")
 _output_lock = threading.RLock()
+
+
+class AddedAccount(NamedTuple):
+    """The account :func:`add_current_login` registered or refreshed.
+
+    ``created`` is False when the login was already managed and its stored
+    copy was only refreshed in place (``cswap add`` again).
+    """
+
+    slot: str
+    email: str
+    created: bool
+
+
+class ProjectMapping(NamedTuple):
+    """One directory mapping (``cswap map``): the normalised directory, the
+    account's slot (``None`` when the account was removed) and its email."""
+
+    path: str
+    slot: str | None
+    email: str
 
 
 class ProjectAccount(NamedTuple):
@@ -252,6 +281,105 @@ def switch_to(switcher: ClaudeAccountSwitcher, identifier: str) -> dict[str, Any
     if payload is None:  # pragma: no cover - json_output never returns None
         raise SwitchError(f"claude-swap returned no switch result for {identifier}")
     return payload
+
+
+def add_current_login(
+    switcher: ClaudeAccountSwitcher, *, alias: str | None = None
+) -> AddedAccount:
+    """Register the default profile's live login (the silent ``cswap add``).
+
+    The login is whatever Claude Code is logged in to in the default profile
+    (``claude``, then ``/login``, with ``CLAUDE_CONFIG_DIR`` unset). A login
+    that is already managed is refreshed in its slot; a new one takes the
+    next free slot. ``alias`` sets the account's alias (unique). Raises
+    :class:`ConfigError` without a live login or from a foreign profile and
+    :class:`ValidationError` for a bad or taken alias or a credential that
+    belongs to another account. Never prompts.
+    """
+    _refuse_foreign_profile()
+    with _quiet():
+        before = set((switcher._get_sequence_data() or {}).get("accounts", {}))
+        switcher.add_account(slot=None, assume_yes=True, alias=alias)
+        slot = switcher.current_account_number()
+        if slot is None:  # pragma: no cover - add_account just stored it
+            raise ConfigError("the live login was not registered")
+        email = switcher.account_email(slot)
+    return AddedAccount(slot=slot, email=email, created=slot not in before)
+
+
+def remove_account(switcher: ClaudeAccountSwitcher, identifier: str) -> tuple[str, str]:
+    """Remove a managed account (the silent ``cswap remove``) and its mappings.
+
+    ``identifier`` is a slot, alias or email; an email that matches several
+    accounts raises :class:`ConfigError` instead of prompting. An account
+    with a live ``cswap run`` session is refused (:class:`SessionError`).
+    Removing the active account leaves the default profile logged in; it is
+    only no longer managed. Returns ``(slot, email)`` of the removed account.
+    """
+    _refuse_foreign_profile()
+    with _quiet():
+        slot, email, _org = switcher.resolve_account(identifier)
+        switcher.remove_account(slot, assume_yes=True)
+    return slot, email
+
+
+def set_alias(
+    switcher: ClaudeAccountSwitcher, identifier: str, alias: str | None
+) -> str | None:
+    """Set, rename or (``alias=None``) clear an account's alias.
+
+    Returns the stored (normalised) alias, or ``None`` after clearing.
+    Raises :class:`ValidationError` for an invalid alias and
+    :class:`ConfigError` for one another account uses.
+    """
+    with _quiet():
+        if alias is None:
+            switcher.unset_alias(identifier)
+            return None
+        _num, stored = switcher.set_alias(identifier, alias)
+    return stored
+
+
+def map_project(
+    switcher: ClaudeAccountSwitcher,
+    path: str | os.PathLike[str],
+    identifier: str,
+) -> ProjectAccount:
+    """Map a directory to an account (the silent ``cswap map``).
+
+    The directory and everything below it then resolves to that account
+    (:func:`project_account`); a mapping on the same directory is replaced.
+    """
+    from claude_swap.mappings import MappingStore
+
+    with _quiet():
+        slot, email, org_uuid = switcher.resolve_account(identifier)
+        MappingStore(switcher.backup_dir).set(Path(path), email, org_uuid)
+    return ProjectAccount(slot=slot, email=email)
+
+
+def unmap_project(switcher: ClaudeAccountSwitcher, path: str | os.PathLike[str]) -> bool:
+    """Remove the mapping of exactly this directory; returns whether one existed."""
+    from claude_swap.mappings import MappingStore
+
+    with _quiet():
+        return MappingStore(switcher.backup_dir).remove(Path(path))
+
+
+def project_mappings(switcher: ClaudeAccountSwitcher) -> list[ProjectMapping]:
+    """Every directory mapping, sorted by directory."""
+    from claude_swap.mappings import MappingStore
+
+    with _quiet():
+        stored = MappingStore(switcher.backup_dir).all()
+        data = switcher._get_sequence_data() or {}
+        mappings: list[ProjectMapping] = []
+        for path, record in sorted(stored.items()):
+            email = str(record.get("email", ""))
+            org = str(record.get("organizationUuid", "") or "")
+            slot = switcher._find_account_slot(data, email, org) if data else None
+            mappings.append(ProjectMapping(path=path, slot=slot, email=email))
+    return mappings
 
 
 def set_rotation(

@@ -379,6 +379,17 @@ Three helpers add guards the CLI applies in its own flows:
 - `running_autoswitchers(switcher)` lists the auto-switch engines running against this store (`cswap auto`, the menu bar, an embedding program). Each engine records itself in `<backup_root>/autoswitch/instances/<pid>.json` while its loop runs; records of dead processes are pruned. The registry is informational, not a lock.
 - `shared_grants(switcher, ["~/.claude-work"])` reports managed accounts whose stored login is the login of one of the given Claude profile directories (compared by refresh-token fingerprint), returning slot, email and directory only.
 
+Account management is silent and never prompts either:
+
+```python
+api.add_current_login(switcher, alias="work")  # `cswap add`: the default profile's login
+api.remove_account(switcher, "2")              # `cswap remove 2` (and its mappings)
+api.set_alias(switcher, "2", "side")           # `cswap alias`; None clears it
+api.map_project(switcher, "~/code/app", "2")   # `cswap map 2 ~/code/app`
+api.unmap_project(switcher, "~/code/app")      # `cswap unmap ~/code/app`
+api.project_mappings(switcher)                 # every mapping with its slot
+```
+
 ### Add an account from a raw token or API key
 
 If you only have a long-lived setup-token (e.g., produced by `claude setup-token`)
