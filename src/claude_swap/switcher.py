@@ -3733,6 +3733,170 @@ class ClaudeAccountSwitcher:
             print(f"{dimmed(f'Moved from slot {migrate_from} → {slot}')}")
         print(f"{accent('Added')} Account {account_num}: {current_email} {muted(f'[{tag}]')}")
 
+    def _profile_oauth_account(self, config_dir: str) -> dict:
+        """The ``oauthAccount`` block of a ``CLAUDE_CONFIG_DIR`` profile's own
+        config (``<dir>/.claude.json``, or the legacy ``<dir>/.config.json``
+        when that exists, as Claude resolves it).
+
+        Raises:
+            ConfigError: the profile holds no login, or its config is unreadable.
+        """
+        directory = Path(config_dir)
+        legacy = directory / ".config.json"
+        path = legacy if legacy.exists() else directory / ".claude.json"
+        if not path.exists():
+            raise ConfigError(
+                f"No Claude login found in profile {config_dir}. Please log in first."
+            )
+        try:
+            data = json.loads(path.read_text(encoding="utf-8"))
+        except (OSError, ValueError) as e:
+            raise ConfigError(f"Cannot read {path}: {e}") from e
+        oauth_account = data.get("oauthAccount") if isinstance(data, dict) else None
+        if not isinstance(oauth_account, dict) or not oauth_account.get("emailAddress"):
+            raise ConfigError(
+                f"No Claude login found in profile {config_dir}. Please log in first."
+            )
+        return oauth_account
+
+    def add_account_from_profile(
+        self, config_dir: str, alias: str | None = None
+    ) -> tuple[str, bool]:
+        """Register the login of a separate Claude profile; the default
+        profile is left alone.
+
+        ``config_dir`` is the ``CLAUDE_CONFIG_DIR`` a login ran with
+        (``CLAUDE_CONFIG_DIR=<dir> claude auth login``), as that exact
+        string: Claude names the profile's Keychain item after it. The
+        identity comes from the profile's ``.claude.json`` and the credential
+        from the store Claude keeps for the profile (its hashed Keychain item
+        on macOS, its ``.credentials.json`` elsewhere), so both come from one
+        profile and agree.
+
+        The default profile's login and the recorded active account do not
+        change:
+
+        * a new account takes the next free slot, with ``alias``;
+        * an account already managed gets the profile's login as its stored
+          login and keeps its alias (``alias`` is not used);
+        * the account the default profile is logged in to gets no second,
+          independent login: its stored login follows the live one (switching
+          and the auto-switch engine keep the two in step). When it is managed
+          nothing changes; when it is not, the live login is registered, as
+          ``add_account`` would.
+
+        The profile keeps its login until
+        :func:`claude_swap.session.forget_config_dir_login` removes it.
+        Returns ``(slot, created)``.
+
+        Raises:
+            ConfigError: the profile has no login, or its credential belongs
+                to another account.
+            CredentialReadError: the profile's credential is missing or its
+                Keychain item is unreadable.
+            ValidationError: a bad or taken alias, or an API-key login.
+        """
+        from claude_swap.session import read_config_dir_credentials
+
+        self._refuse_session_shell()
+        self._setup_directories()
+        self._init_sequence_file()
+        self._migrate_org_fields()
+
+        if alias is not None:
+            try:
+                alias = normalize_alias(alias)
+            except ValueError as e:
+                raise ValidationError(str(e)) from e
+
+        oauth_account = self._profile_oauth_account(config_dir)
+        email = oauth_account["emailAddress"]
+        org_uuid = oauth_account.get("organizationUuid") or ""
+        account_uuid = oauth_account.get("accountUuid") or ""
+
+        if self._get_current_account() == (email, org_uuid):
+            data = self._get_sequence_data() or {}
+            live_slot = self._find_account_slot(data, email, org_uuid)
+            if live_slot is not None:
+                return live_slot, False
+            self.add_account(slot=None, assume_yes=True, alias=alias)
+            registered = self.current_account_number()
+            if registered is None:  # pragma: no cover - add_account just stored it
+                raise ConfigError("the live login was not registered")
+            return registered, True
+
+        creds = read_config_dir_credentials(config_dir, strict_keychain=True)
+        if not creds:
+            raise CredentialReadError(
+                f"No credentials found for profile {config_dir}. Please log in first."
+            )
+        if looks_like_api_key(creds):
+            raise ValidationError(
+                f"The login in {config_dir} is an API key. Add it with "
+                "'cswap --add-token sk-ant-api...' instead."
+            )
+        creds = self._reject_foreign_credential_capture(
+            creds, email, org_uuid, account_uuid
+        )
+        if not org_uuid:
+            self._reject_cross_kind_collision(email, is_api_key=False)
+        # The identity block alone, as add_account_from_token stores it: a
+        # switch splices only oauthAccount into the live config, and a
+        # session profile is seeded from it too.
+        config = json.dumps({"oauthAccount": oauth_account})
+
+        data = self._get_sequence_data()
+        existing = self._find_account_slot(data, email, org_uuid)
+        if existing is not None:
+            self._write_account_credentials(existing, email, creds)
+            self._write_account_config(existing, email, config)
+            self._usage_store.clear_dead_token(
+                [existing], {existing: (email, org_uuid)}
+            )
+            data = self._get_sequence_data()
+            data["lastUpdated"] = get_timestamp()
+            self._write_json(self.sequence_file, data)
+            self._logger.info(
+                f"Updated credentials for account {existing} from a profile: {email}"
+            )
+            print(f"{accent('Updated credentials')} for Account {existing} ({email}).")
+            return existing, False
+
+        if alias is not None:
+            conflict = self._alias_in_use(alias)
+            if conflict is not None:
+                raise ValidationError(
+                    f"Alias '{alias}' is already used by account {conflict}"
+                )
+        account_num = str(self._get_next_account_number())
+        self._write_account_credentials(account_num, email, creds)
+        self._write_account_config(account_num, email, config)
+        self._usage_store.clear_dead_token(
+            [account_num], {account_num: (email, org_uuid)}
+        )
+        data = self._get_sequence_data()
+        record = {
+            "email": email,
+            "uuid": account_uuid,
+            "organizationUuid": org_uuid,
+            "organizationName": oauth_account.get("organizationName") or "",
+            "added": get_timestamp(),
+        }
+        if alias:
+            record["alias"] = alias
+        data["accounts"][account_num] = record
+        if int(account_num) not in data["sequence"]:
+            data["sequence"].append(int(account_num))
+            data["sequence"].sort()
+        data["lastUpdated"] = get_timestamp()
+        self._write_json(self.sequence_file, data)
+        tag = self._get_display_tag(
+            email, record["organizationName"], org_uuid
+        )
+        self._logger.info(f"Added account {account_num} from a profile: {email}")
+        print(f"{accent('Added')} Account {account_num}: {email} {muted(f'[{tag}]')}")
+        return account_num, True
+
     def add_account_from_token(
         self,
         token: str,

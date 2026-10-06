@@ -55,7 +55,9 @@ EXPECTED_ALL = [
     "accounts_json",
     "active_account",
     "add_current_login",
+    "add_profile_login",
     "create_engine",
+    "forget_profile_login",
     "inject_system_trust",
     "live_session_accounts",
     "map_project",
@@ -114,6 +116,11 @@ EXPECTED_SIGNATURES = {
         "(switcher: 'ClaudeAccountSwitcher', *, alias: 'str | None' = None)"
         " -> 'AddedAccount'"
     ),
+    "add_profile_login": (
+        "(switcher: 'ClaudeAccountSwitcher', config_dir: 'str | os.PathLike[str]', "
+        "*, alias: 'str | None' = None) -> 'AddedAccount'"
+    ),
+    "forget_profile_login": "(config_dir: 'str | os.PathLike[str]') -> 'None'",
     "remove_account": (
         "(switcher: 'ClaudeAccountSwitcher', identifier: 'str') -> 'tuple[str, str]'"
     ),
@@ -699,3 +706,166 @@ class TestAccountManagement:
         (mapping,) = api.project_mappings(seeded.switcher)
         assert mapping.slot is None
         assert mapping.email == "gone@example.com"
+
+
+def _profile_login(
+    directory: Path,
+    email: str,
+    uuid: str,
+    *,
+    credentials: str | None = None,
+) -> Path:
+    """A ``CLAUDE_CONFIG_DIR`` profile as ``claude auth login`` leaves it."""
+    directory.mkdir(parents=True, exist_ok=True)
+    (directory / ".credentials.json").write_text(
+        credentials
+        or json.dumps({
+            "claudeAiOauth": {"accessToken": f"sk-{uuid}", "refreshToken": f"rt-{uuid}"}
+        })
+    )
+    (directory / ".claude.json").write_text(json.dumps({
+        "numStartups": 1,
+        "oauthAccount": {
+            "emailAddress": email,
+            "accountUuid": uuid,
+            "organizationUuid": None,
+            "organizationName": None,
+        },
+    }))
+    return directory
+
+
+class TestProfileLogin:
+    """Adding an account from a separate profile, never the default one (sak.3)."""
+
+    @pytest.fixture(autouse=True)
+    def _no_network(self, monkeypatch):
+        monkeypatch.setattr(
+            "claude_swap.oauth.fetch_oauth_profile", lambda *_a, **_k: None
+        )
+
+    @staticmethod
+    def _default_profile(home: Path) -> tuple[str, str]:
+        return (
+            (home / ".claude" / ".credentials.json").read_text(),
+            (home / ".claude.json").read_text(),
+        )
+
+    def test_a_new_account_takes_the_next_slot_and_the_default_stays(
+        self, seeded, tmp_path, capfd
+    ):
+        before = self._default_profile(seeded.temp_home)
+        profile = _profile_login(tmp_path / "login", "c@example.com", "uuid-3")
+        capfd.readouterr()
+        added = api.add_profile_login(seeded.switcher, profile, alias="Work")
+        _assert_silent(capfd)
+        assert added == api.AddedAccount(slot="3", email="c@example.com", created=True)
+        rows = {r["number"]: r for r in api.accounts_json(seeded.switcher)["accounts"]}
+        assert rows[3].get("alias") == "work"
+        assert rows[1]["active"] is True
+        assert rows[3]["active"] is False
+        assert api.active_account(seeded.switcher) == "1"
+        assert self._default_profile(seeded.temp_home) == before
+        stored = seeded.switcher._read_account_credentials("3", "c@example.com")
+        assert stored == (profile / ".credentials.json").read_text()
+        config = json.loads(seeded.switcher.read_account_config("3", "c@example.com"))
+        assert set(config) == {"oauthAccount"}
+        assert config["oauthAccount"]["emailAddress"] == "c@example.com"
+
+    def test_a_managed_account_gets_the_login_and_keeps_its_alias(
+        self, seeded, tmp_path
+    ):
+        api.set_alias(seeded.switcher, "2", "side")
+        profile = _profile_login(tmp_path / "login", "b@example.com", "uuid-2b")
+        added = api.add_profile_login(seeded.switcher, profile, alias="other")
+        assert added == api.AddedAccount(slot="2", email="b@example.com", created=False)
+        stored = seeded.switcher._read_account_credentials("2", "b@example.com")
+        assert stored == (profile / ".credentials.json").read_text()
+        rows = {r["number"]: r for r in api.accounts_json(seeded.switcher)["accounts"]}
+        assert rows[2].get("alias") == "side"
+        assert api.active_account(seeded.switcher) == "1"
+
+    def test_the_default_login_gets_no_second_login(self, seeded, tmp_path):
+        before = seeded.switcher._read_account_credentials("1", "a@example.com")
+        profile = _profile_login(tmp_path / "login", "a@example.com", "uuid-1b")
+        added = api.add_profile_login(seeded.switcher, profile)
+        assert added == api.AddedAccount(slot="1", email="a@example.com", created=False)
+        assert seeded.switcher._read_account_credentials("1", "a@example.com") == before
+
+    def test_an_unmanaged_default_login_is_registered_from_the_live_login(
+        self, temp_home, no_stdin, tmp_path
+    ):
+        h = EngineHarness(temp_home)
+        _live_login(temp_home, "c@example.com", "uuid-3")
+        profile = _profile_login(tmp_path / "login", "c@example.com", "uuid-3b")
+        added = api.add_profile_login(h.switcher, profile, alias="home")
+        assert added == api.AddedAccount(slot="1", email="c@example.com", created=True)
+        stored = h.switcher._read_account_credentials("1", "c@example.com")
+        assert "rt-uuid-3" in stored
+        assert "rt-uuid-3b" not in stored
+
+    def test_a_profile_without_a_login_is_refused(self, seeded, tmp_path):
+        empty = tmp_path / "empty"
+        empty.mkdir()
+        with pytest.raises(api.ConfigError, match="log in first"):
+            api.add_profile_login(seeded.switcher, empty)
+        no_credential = _profile_login(tmp_path / "half", "c@example.com", "uuid-3")
+        (no_credential / ".credentials.json").unlink()
+        with pytest.raises(api.CredentialError, match="log in first"):
+            api.add_profile_login(seeded.switcher, no_credential)
+        rows = api.accounts_json(seeded.switcher)["accounts"]
+        assert [r["number"] for r in rows] == [1, 2]
+
+    def test_an_api_key_and_a_taken_alias_are_refused(self, seeded, tmp_path):
+        key = _profile_login(
+            tmp_path / "key", "c@example.com", "uuid-3", credentials="sk-ant-api03-x"
+        )
+        with pytest.raises(api.ValidationError, match="API key"):
+            api.add_profile_login(seeded.switcher, key)
+        api.set_alias(seeded.switcher, "1", "main")
+        profile = _profile_login(tmp_path / "login", "c@example.com", "uuid-3")
+        with pytest.raises(api.ValidationError, match="already used"):
+            api.add_profile_login(seeded.switcher, profile, alias="main")
+        rows = api.accounts_json(seeded.switcher)["accounts"]
+        assert [r["number"] for r in rows] == [1, 2]
+
+    def test_refuses_a_foreign_profile(self, seeded, monkeypatch, tmp_path):
+        profile = _profile_login(tmp_path / "login", "c@example.com", "uuid-3")
+        monkeypatch.setenv("CLAUDE_CONFIG_DIR", str(tmp_path / "hand-made"))
+        with pytest.raises(api.ConfigError, match="CLAUDE_CONFIG_DIR"):
+            api.add_profile_login(seeded.switcher, profile)
+
+    def test_forget_removes_the_profiles_credential(self, tmp_path, capfd):
+        profile = _profile_login(tmp_path / "login", "c@example.com", "uuid-3")
+        capfd.readouterr()
+        api.forget_profile_login(profile)
+        api.forget_profile_login(profile)  # already gone is fine
+        _assert_silent(capfd)
+        assert not (profile / ".credentials.json").exists()
+
+    def test_forget_removes_the_keychain_entry_named_after_the_profile(
+        self, tmp_path, monkeypatch
+    ):
+        from claude_swap import macos_keychain, session
+
+        removed: list[tuple[str, str]] = []
+        monkeypatch.setattr(
+            session.Platform, "detect", classmethod(lambda _cls: Platform.MACOS)
+        )
+        monkeypatch.setattr(
+            macos_keychain,
+            "delete_password",
+            lambda service, account: removed.append((service, account)),
+        )
+        profile = _profile_login(tmp_path / "login", "c@example.com", "uuid-3")
+        api.forget_profile_login(str(profile))
+        assert [service for service, _ in removed] == [
+            session.keychain_service_name(str(profile))
+        ]
+
+        def locked(_service, _account):
+            raise macos_keychain.KeychainError("the keychain is locked")
+
+        monkeypatch.setattr(macos_keychain, "delete_password", locked)
+        with pytest.raises(api.CredentialError, match="keychain"):
+            api.forget_profile_login(str(profile))

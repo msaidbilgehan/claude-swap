@@ -53,6 +53,7 @@ from claude_swap.claude_locks import proper_lockfile
 from claude_swap.exceptions import (
     ClaudeCodeLockTimeout,
     CredentialReadError,
+    CredentialWriteError,
     SessionError,
 )
 from claude_swap.fsutil import replace_with_retry
@@ -267,6 +268,36 @@ def delete_macos_keychain_entry(session_dir: Path) -> None:
         )
     except macos_keychain.KEYCHAIN_ERRORS:
         pass  # best-effort; absent entry is already success (rc 44)
+
+
+def forget_config_dir_login(config_dir: str) -> None:
+    """Remove the login Claude keeps for a ``CLAUDE_CONFIG_DIR``: its hashed
+    keychain entry on macOS and its ``.credentials.json``.
+
+    For a profile that only carried a login to be registered
+    (``add_account_from_profile``), once it is stored or abandoned.
+    ``config_dir`` is the exact string the login ran with: the entry's name
+    is hashed from it. Unlike :func:`delete_macos_keychain_entry` this is not
+    best-effort: a login meant to be gone must not stay behind silently.
+
+    Raises:
+        CredentialWriteError: the entry or the file could not be removed.
+    """
+    if Platform.detect() == Platform.MACOS:
+        try:
+            macos_keychain.delete_password(
+                keychain_service_name(config_dir), _keychain_account_name()
+            )
+        except macos_keychain.KEYCHAIN_ERRORS as e:
+            raise CredentialWriteError(
+                f"Could not remove the keychain entry of profile {config_dir}: {e}"
+            ) from e
+    try:
+        (Path(config_dir) / ".credentials.json").unlink(missing_ok=True)
+    except OSError as e:
+        raise CredentialWriteError(
+            f"Could not remove {config_dir}/.credentials.json: {e}"
+        ) from e
 
 
 def read_session_credentials(session_dir: Path) -> str | None:

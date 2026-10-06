@@ -69,6 +69,7 @@ from claude_swap.paths import get_claude_config_home, get_default_claude_config_
 from claude_swap.session import (
     AUTH_OVERRIDE_ENV_VARS,
     SessionManager,
+    forget_config_dir_login,
     read_config_dir_credentials,
 )
 from claude_swap.settings import AutoSwitchSettings, load_settings
@@ -106,7 +107,9 @@ __all__ = [
     "accounts_json",
     "active_account",
     "add_current_login",
+    "add_profile_login",
     "create_engine",
+    "forget_profile_login",
     "inject_system_trust",
     "live_session_accounts",
     "map_project",
@@ -129,7 +132,8 @@ _output_lock = threading.RLock()
 
 
 class AddedAccount(NamedTuple):
-    """The account :func:`add_current_login` registered or refreshed.
+    """The account :func:`add_current_login` or :func:`add_profile_login`
+    registered or refreshed.
 
     ``created`` is False when the login was already managed and its stored
     copy was only refreshed in place (``cswap add`` again).
@@ -305,6 +309,52 @@ def add_current_login(
             raise ConfigError("the live login was not registered")
         email = switcher.account_email(slot)
     return AddedAccount(slot=slot, email=email, created=slot not in before)
+
+
+def add_profile_login(
+    switcher: ClaudeAccountSwitcher,
+    config_dir: str | os.PathLike[str],
+    *,
+    alias: str | None = None,
+) -> AddedAccount:
+    """Register the login of a separate Claude profile; the default profile
+    is never read or written.
+
+    For adding an account without touching the default login: log in with
+    ``CLAUDE_CONFIG_DIR=<config_dir> claude auth login`` (an empty
+    directory), then pass the same string here. A new account takes the next
+    free slot with ``alias``; an account already managed gets this login as
+    its stored login and keeps its alias; the account the default profile is
+    logged in to keeps following the live login (nothing changes, or the
+    live login is registered when it is not managed yet). The recorded active
+    account does not change. The profile keeps its login until
+    :func:`forget_profile_login`.
+
+    Raises :class:`ConfigError` when the profile has no login or its
+    credential belongs to another account, :class:`CredentialError` when the
+    credential is missing or unreadable, and :class:`ValidationError` for a
+    bad or taken alias or an API-key login. Never prompts.
+    """
+    _refuse_foreign_profile()
+    with _quiet():
+        slot, created = switcher.add_account_from_profile(
+            os.fspath(config_dir), alias=alias
+        )
+        email = switcher.account_email(slot)
+    return AddedAccount(slot=slot, email=email, created=created)
+
+
+def forget_profile_login(config_dir: str | os.PathLike[str]) -> None:
+    """Remove the login a separate Claude profile keeps (its keychain entry
+    on macOS and its ``.credentials.json``), once :func:`add_profile_login`
+    stored it or it is abandoned.
+
+    ``config_dir`` is the exact string the login ran with: the keychain
+    entry is named after it. Removing a login that is already gone is fine.
+    Raises :class:`CredentialError` when it stays.
+    """
+    with _quiet():
+        forget_config_dir_login(os.fspath(config_dir))
 
 
 def remove_account(switcher: ClaudeAccountSwitcher, identifier: str) -> tuple[str, str]:

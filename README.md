@@ -383,12 +383,16 @@ Account management is silent and never prompts either:
 
 ```python
 api.add_current_login(switcher, alias="work")  # `cswap add`: the default profile's login
+api.add_profile_login(switcher, "/tmp/login-x", alias="work")  # another profile's login
+api.forget_profile_login("/tmp/login-x")       # then drop the login that profile keeps
 api.remove_account(switcher, "2")              # `cswap remove 2` (and its mappings)
 api.set_alias(switcher, "2", "side")           # `cswap alias`; None clears it
 api.map_project(switcher, "~/code/app", "2")   # `cswap map 2 ~/code/app`
 api.unmap_project(switcher, "~/code/app")      # `cswap unmap ~/code/app`
 api.project_mappings(switcher)                 # every mapping with its slot
 ```
+
+`add_profile_login` adds an account without touching the default login: log in with `CLAUDE_CONFIG_DIR=<empty dir> claude auth login`, then pass that exact directory string (Claude names the profile's Keychain item after it). The identity and the credential both come from that profile; the default profile and the active account stay as they are. An account already managed gets the new login and keeps its alias; the account the default profile is logged in to keeps following its live login. `forget_profile_login` removes the login the profile keeps (its Keychain item, its `.credentials.json`) once it is stored or abandoned.
 
 ### Add an account from a raw token or API key
 
