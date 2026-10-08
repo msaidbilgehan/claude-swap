@@ -244,16 +244,23 @@ def open_switcher() -> ClaudeAccountSwitcher:
 
 
 def accounts_json(
-    switcher: ClaudeAccountSwitcher, fetch: Collection[str] = frozenset()
+    switcher: ClaudeAccountSwitcher, fetch: Collection[str] | None = frozenset()
 ) -> dict[str, Any]:
     """The ``cswap list --json`` payload (``schemaVersion`` 1).
 
     ``fetch`` names the account numbers whose usage may be fetched from the
     network in this call; the default (empty) serves usage from the cache
-    only. With no accounts managed yet the payload has an empty list.
+    only. ``None`` refreshes what is due, as ``cswap list`` does: every
+    account whose persisted poll plan is due and whose reading is older than
+    the serve TTL is fetched (failure backoff, 429 handling and claims
+    against concurrent collectors apply, and the adapted plans are saved);
+    the rest is served from the cache. The auto-switch engine never polls a
+    disabled account, so this is what keeps one's usage fresh. With no
+    accounts managed yet the payload has an empty list.
     """
+    wanted = None if fetch is None else set(fetch)
     with _quiet():
-        payload = switcher.list_accounts(json_output=True, fetch=set(fetch))
+        payload = switcher.list_accounts(json_output=True, fetch=wanted)
     if payload is None:  # pragma: no cover - json_output never returns None
         raise ConfigError("claude-swap returned no account list")
     return payload

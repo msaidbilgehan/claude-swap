@@ -78,8 +78,8 @@ EXPECTED_ALL = [
 EXPECTED_SIGNATURES = {
     "open_switcher": "() -> 'ClaudeAccountSwitcher'",
     "accounts_json": (
-        "(switcher: 'ClaudeAccountSwitcher', fetch: 'Collection[str]' = frozenset())"
-        " -> 'dict[str, Any]'"
+        "(switcher: 'ClaudeAccountSwitcher', "
+        "fetch: 'Collection[str] | None' = frozenset()) -> 'dict[str, Any]'"
     ),
     "project_account": (
         "(switcher: 'ClaudeAccountSwitcher', path: 'str | os.PathLike[str]')"
@@ -301,7 +301,43 @@ class TestAccounts:
         monkeypatch.setattr(seeded.switcher, "_collect_usage_entries", spy)
         api.accounts_json(seeded.switcher)
         api.accounts_json(seeded.switcher, fetch={"2"})
-        assert seen == [set(), {"2"}]
+        api.accounts_json(seeded.switcher, fetch=None)
+        assert seen == [set(), {"2"}, None]
+
+    def test_none_fetches_what_is_due_including_a_disabled_account(
+        self, seeded, capfd
+    ):
+        from unittest.mock import patch
+
+        from claude_swap.usage_store import FetchRecord
+
+        api.set_rotation(seeded.switcher, "2", enabled=False)
+        usage = {"five_hour": {"pct": 10.0}, "seven_day": {"pct": 20.0}}
+        fetched: list[list[str]] = []
+
+        def run(infos, entries=None):
+            fetched.append(sorted(str(info[0]) for info in infos))
+            return {str(info[0]): FetchRecord(usage=usage) for info in infos}
+
+        capfd.readouterr()
+        with patch.object(seeded.switcher, "_run_usage_fetches", side_effect=run):
+            api.accounts_json(seeded.switcher)  # the default stays cache-only
+            assert fetched == []
+            payload = api.accounts_json(seeded.switcher, None)  # never fetched
+            assert fetched == [["1", "2"]]
+            # Past the serve TTL: the active account's shorter plan is due, the
+            # disabled account's is not, so it is not fetched yet.
+            seeded.clock.advance(200)
+            api.accounts_json(seeded.switcher, None)
+            assert fetched == [["1", "2"], ["1"]]
+            seeded.clock.advance(800)  # past every poll plan
+            api.accounts_json(seeded.switcher, None)
+            assert fetched == [["1", "2"], ["1"], ["1", "2"]]
+        _assert_silent(capfd)
+        rows = {row["number"]: row for row in payload["accounts"]}
+        assert rows[2]["disabled"] is True
+        assert rows[2]["usageStatus"] == "ok"
+        assert rows[2]["usage"]["sevenDay"]["pct"] == 20.0
 
     def test_active_account(self, seeded, capfd):
         capfd.readouterr()
