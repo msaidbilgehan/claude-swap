@@ -335,6 +335,44 @@ class CredentialStore:
         # flag above can stand in for it.
         self._residual_verdict: bool | None = None
         self._last_active_credentials_backend: str | None = None
+        # Opt-in for a store inside a long-running process (claude-SAK's daemon:
+        # `api.open_switcher` sets it). There the failure cooldown only schedules
+        # a re-probe (the no-split-brain guarantee it gives one CLI command does
+        # not apply), so the Keychain is re-probed early: the active read asks
+        # it during a cooldown, and any answer ends one. A pin is never ended.
+        # See `_active_read_reprobes`.
+        self.early_reprobe: bool = False
+
+    def _failure_cooldown_pending(self) -> bool:
+        """File mode that a failed op entered and a re-probe will end.
+
+        A pin is not one: `_pin_file_mode` zeroes the deadline and stays.
+        """
+        return (
+            self._keychain_usable_cache is False
+            and self._keychain_disabled_until != 0.0
+        )
+
+    def _active_read_reprobes(self) -> bool:
+        """Whether the active OAuth read asks a Keychain that routing has left.
+
+        Only with ``early_reprobe``, during a failure cooldown. Any item's
+        failure starts the cooldown, and backup reads keep asking the Keychain
+        through it (`_read_account_credentials` goes straight to
+        `_kc_read_backup`); the active read alone waited it out. Once a sibling
+        backup read had cleared `_keychain_op_failed`, its empty result read as
+        "no credentials" for up to a minute. Measured in claude-SAK, where the
+        active login lives only in the Keychain: slot 1's backup read timed
+        out, and the next pass listed slots 1 and 2 fine and the active slot 3
+        as "no credentials" until the cooldown ran out. Asking costs one
+        bounded read; an answer ends the cooldown (`_kc_call`), and a failure
+        re-arms it and reads as "keychain unavailable", as before.
+        """
+        return (
+            self.early_reprobe
+            and self._host.platform == Platform.MACOS
+            and self._failure_cooldown_pending()
+        )
 
     def _kc_call(self, fn, *args):
         """Run a ``macos_keychain`` wrapper call, learning Keychain usability.
@@ -342,7 +380,9 @@ class CredentialStore:
         A success (including ``get_password`` returning ``None`` for a missing
         item) marks the Keychain usable — but only flips the cache ``None -> True``,
         never ``False -> True``: once a call has failed this run we stay in file
-        mode so one invocation can't split-brain between backends. A
+        mode so one invocation can't split-brain between backends. With
+        ``early_reprobe`` (a long-running process) a success also ends a
+        failure cooldown, never a pin. A
         ``KeychainError`` / ``TimeoutExpired`` / ``OSError`` (binary missing) marks
         it unusable and re-raises so the caller can fall back. Only those three are
         caught — a programming error propagates.
@@ -382,6 +422,13 @@ class CredentialStore:
         self._keychain_op_failed = False
         if self._keychain_usable_cache is None:
             self._keychain_usable_cache = True
+        elif self.early_reprobe and self._failure_cooldown_pending():
+            # The re-probe a lapsed cooldown would make, arrived early. Routing
+            # follows the Keychain that just answered, so a write later in the
+            # same pass lands there instead of falling back to the file and
+            # deleting the item Claude Code reads first.
+            self._keychain_usable_cache = True
+            self._keychain_disabled_until = 0.0
         return result
 
     def _use_keychain(self) -> bool:
@@ -603,7 +650,7 @@ class CredentialStore:
         # codebase either: session.keychain_service_name codifies claude's
         # derivation (pinned against its source) and the delete, session-read
         # and capture paths already depend on it.
-        if self._use_keychain():
+        if self._use_keychain() or self._active_read_reprobes():
             val, keychain_failed = self._read_active_oauth_keychain()
             # THIS read's own verdict, kept so a later success on some OTHER
             # item cannot erase it. Sticky until this read succeeds again,

@@ -237,10 +237,17 @@ def open_switcher() -> ClaudeAccountSwitcher:
     Runs claude-swap's one-time data migrations like the CLI does. Raises
     :class:`ConfigError` when ``CLAUDE_CONFIG_DIR`` names any profile but the
     default one.
+
+    The switcher serves a long-running process, so its credential store
+    re-probes the macOS Keychain early (``CredentialStore.early_reprobe``):
+    another item's ``security`` timeout no longer hides the active login for
+    the next minute.
     """
     _refuse_foreign_profile()
     with _quiet():
-        return ClaudeAccountSwitcher()
+        switcher = ClaudeAccountSwitcher()
+    switcher._store.early_reprobe = True
+    return switcher
 
 
 def accounts_json(

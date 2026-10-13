@@ -371,7 +371,7 @@ engine = api.create_engine(switcher, on_event=print, dry_run=True)  # saved sett
 # run engine.run_loop() on its own thread; engine.stop() ends it
 ```
 
-`open_switcher()` refuses to start when `CLAUDE_CONFIG_DIR` names any profile but the default one, because the live store follows that variable. The exported names and signatures are pinned by `tests/test_public_api.py`.
+`open_switcher()` refuses to start when `CLAUDE_CONFIG_DIR` names any profile but the default one, because the live store follows that variable. The switcher it returns is meant for a long-running program: when a macOS Keychain call fails, it keeps asking the Keychain for the active login and goes back to the Keychain for everything as soon as the Keychain answers again, instead of staying on the file fallback until a one-minute cooldown ends (what the CLI, the TUI and the menu bar do). The exported names and signatures are pinned by `tests/test_public_api.py`.
 
 Three helpers add guards the CLI applies in its own flows:
 
