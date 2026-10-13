@@ -321,6 +321,33 @@ class UsageEntry:
     def in_backoff(self, now: float) -> bool:
         return self.backoff_until is not None and now < self.backoff_until
 
+    def next_check_at(self, now: float) -> float | None:
+        """When an on-demand collector next fetches this account's usage.
+
+        ``cswap list`` (and ``api.accounts_json(switcher, None)``) fetches an
+        account once its reading is older than ``SERVE_TTL_S``, its poll plan
+        is due (or it has none, or the plan is an obsolete reset-parked one),
+        a failure's backoff has lifted and an adopted reading's hold has
+        ended, as ``UsageStore.reserve`` decides with ``respect_plans``.
+        ``now`` when that is the case already; None for a token quarantined
+        as dead, which is not fetched until a new login. The auto-switch
+        engine, on its own schedule, may poll the active account sooner. A
+        fetch in flight (a live claim, at most ``CLAIM_TTL_S``) is not
+        counted: its own outcome moves the time.
+        """
+        if self.auth_dead_strikes >= AUTH_DEAD_STRIKES:
+            return None
+        due = now
+        if self.fetched_at is not None:
+            due = max(due, self.fetched_at + SERVE_TTL_S)
+        if self.next_poll_at is not None and not plan_oversleeps_interval(self, now):
+            due = max(due, self.next_poll_at)
+        if self.backoff_until is not None:
+            due = max(due, self.backoff_until)
+        if self.held_until is not None:
+            due = max(due, self.held_until)
+        return due
+
     def held(self, now: float) -> bool:
         """Whether an adopted reading's hold still keeps collectors off."""
         return self.held_until is not None and now < self.held_until

@@ -1154,6 +1154,60 @@ class TestPollPlan:
         assert entry.poll_interval_s is None
 
 
+class TestNextCheck:
+    """``UsageEntry.next_check_at``: when ``cswap list`` fetches an account
+    next, as ``reserve(respect_plans=True)`` decides it."""
+
+    def _reserved_at(self, store, clock, when: float) -> bool:
+        clock.now = when
+        return set(store.reserve(["1"], IDENT, respect_plans=True)) == {"1"}
+
+    def test_an_account_never_fetched_is_due_now(self, store, clock):
+        assert store.entries(IDENT)["1"].next_check_at(clock.now) == clock.now
+
+    def test_a_fresh_reading_is_checked_once_older_than_the_serve_ttl(
+        self, store, clock
+    ):
+        store.record({"1": FetchRecord(usage=USAGE)}, IDENT)
+        due = store.entries(IDENT)["1"].next_check_at(clock.now)
+        assert due == clock.now + SERVE_TTL_S
+        assert not self._reserved_at(store, clock, due - 1)
+        assert self._reserved_at(store, clock, due + 1)
+
+    def test_a_later_poll_plan_decides(self, store, clock):
+        store.record({"1": FetchRecord(usage=USAGE)}, IDENT)
+        store.set_poll_plan({"1": (clock.now + 500.0, 500.0)}, IDENT)
+        due = store.entries(IDENT)["1"].next_check_at(clock.now)
+        assert due == clock.now + 500.0
+        assert not self._reserved_at(store, clock, due - 1)
+        assert self._reserved_at(store, clock, due)
+
+    def test_a_failures_backoff_decides(self, store, clock):
+        store.record({"1": FetchRecord(error="http-429", retry_after_s=900.0)}, IDENT)
+        entry = store.entries(IDENT)["1"]
+        assert entry.last_error == "http-429"
+        due = entry.next_check_at(clock.now)
+        assert due == entry.backoff_until
+        assert due is not None and due > clock.now + SERVE_TTL_S
+        assert not self._reserved_at(store, clock, due - 1)
+        assert self._reserved_at(store, clock, due + 1)
+
+    def test_an_obsolete_reset_parked_plan_is_ignored(self, store, clock):
+        store.record({"1": FetchRecord(usage=USAGE)}, IDENT)
+        store.set_poll_plan({"1": (clock.now + 86_400.0, 300.0)}, IDENT)
+        due = store.entries(IDENT)["1"].next_check_at(clock.now)
+        assert due == clock.now + SERVE_TTL_S
+
+    def test_a_dead_token_is_never_checked(self, store, clock):
+        store.record({"1": FetchRecord(error="invalid_grant")}, IDENT)
+        assert store.entries(IDENT)["1"].next_check_at(clock.now) is None
+
+    def test_a_past_time_means_now(self, store, clock):
+        store.record({"1": FetchRecord(usage=USAGE)}, IDENT)
+        clock.advance(10_000.0)
+        assert store.entries(IDENT)["1"].next_check_at(clock.now) == clock.now
+
+
 class TestDueCandidate:
     """Candidate selection shared by the auto engine and the TUI watch view."""
 

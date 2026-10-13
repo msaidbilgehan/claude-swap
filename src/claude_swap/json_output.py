@@ -286,6 +286,27 @@ def usage_failure_fields(
     return out
 
 
+def usage_check_fields(
+    status: str, last_error: str | None, next_check_at: float | None
+) -> dict:
+    """Additive ``usageLastCheckError``/``usageNextCheckAt`` fields for a row
+    whose usage is measured (``ok``: the numbers served may predate a failed
+    check, which the store keeps trusting for a while) or unknown
+    (``unavailable``): the failure of the latest check by kind (``http-429``,
+    ``timeout``, ...) while no later check succeeded, and when ``--list``
+    measures the account next (the current time when that is due now).
+    ``usageError``/``usageRetryAt`` keep their narrower meaning. Every other
+    status explains itself, so nothing is added to it."""
+    if status not in ("ok", "unavailable"):
+        return {}
+    out: dict = {}
+    if last_error:
+        out["usageLastCheckError"] = last_error
+    if next_check_at is not None:
+        out["usageNextCheckAt"] = _timestamp(next_check_at)
+    return out
+
+
 def last_good_usage_fields(
     usage: dict | None, fetched_at: float | None, age_s: float | None
 ) -> dict:
@@ -318,9 +339,11 @@ def account_row(
     alias: str = "",
     disabled: bool = False,
     login_expires_at: str | None = None,
+    next_check_at: float | None = None,
 ) -> dict:
     """A full account row for ``--list``. ``backoff_until`` is the live
-    backoff only; a lapsed one is the caller's to withhold."""
+    backoff only; a lapsed one is the caller's to withhold.
+    ``next_check_at`` is ``UsageEntry.next_check_at``."""
     status, usage = usage_fields(usage_entry, usage_fetched_at)
     row = {
         "number": number,
@@ -352,6 +375,7 @@ def account_row(
             )
         )
         row.update(usage_failure_fields(status, last_error, backoff_until))
+    row.update(usage_check_fields(status, last_error, next_check_at))
     return row
 
 

@@ -21,6 +21,7 @@ from claude_swap.json_output import (
     usage_to_json,
 )
 from claude_swap.credentials import ActiveCredentials
+from claude_swap.poll_policy import SERVE_TTL_S
 from claude_swap.models import Platform
 from claude_swap.switcher import ClaudeAccountSwitcher
 
@@ -355,10 +356,18 @@ class TestListJson:
 
         row = next(a for a in payload["accounts"] if a["number"] == 1)
         assert row["usageStatus"] == expected_status
+        # Served or not, the row says when the next check is due and, once a
+        # check ran (past the serve TTL) and failed, that it failed.
+        assert row["usageNextCheckAt"].endswith("Z")
+        if age_s > SERVE_TTL_S:
+            assert row["usageLastCheckError"] == "timeout"
+        else:
+            assert "usageLastCheckError" not in row
         if expected_status == "ok":
             assert row["usage"]["fiveHour"]["pct"] == 25.0
             assert row["usageAgeSeconds"] >= age_s
             assert "lastGoodUsage" not in row
+            assert "usageError" not in row
         else:
             assert row["usage"] is None
             assert "usageFetchedAt" not in row
@@ -410,6 +419,8 @@ class TestStatusJson:
         assert active["managed"] is True
         assert active["usageStatus"] == "ok"
         assert active["usage"]["fiveHour"]["resetsAt"] == "2026-01-01T00:00:00Z"
+        assert "usageLastCheckError" not in active
+        assert active["usageNextCheckAt"].endswith("Z")
         assert payload["totalManagedAccounts"] == 2
 
     def test_status_managed_includes_display_grade_last_good(
@@ -446,6 +457,8 @@ class TestStatusJson:
         assert active["lastGoodAgeSeconds"] == 4000.0
         assert active["usageError"] == "http-429"
         assert active["usageRetryAt"].endswith("Z")
+        assert active["usageLastCheckError"] == "http-429"
+        assert active["usageNextCheckAt"] == active["usageRetryAt"]
 
     def test_status_managed_includes_alias(
         self, temp_home: Path, mock_claude_config: Path,
@@ -740,6 +753,56 @@ class TestAccountRowFailure:
         )
         assert "usageError" not in row
         assert "usageRetryAt" not in row
+
+
+class TestAccountRowCheck:
+    """The additive ``usageLastCheckError``/``usageNextCheckAt`` fields: how
+    the usage is measured, also while old numbers are still served."""
+
+    def test_served_numbers_after_a_failed_check_say_so(self):
+        row = account_row(
+            2, "b@example.com", "", "", False, {"five_hour": {"pct": 5.0}},
+            usage_fetched_at=1_800_000_000.0,
+            last_error="http-429", backoff_until=1_800_000_900.0,
+            next_check_at=1_800_000_900.0,
+        )
+        assert row["usageStatus"] == "ok"
+        assert row["usageLastCheckError"] == "http-429"
+        assert row["usageNextCheckAt"] == "2027-01-15T08:15:00Z"
+        # the narrower fields keep their meaning: usage is not unknown
+        assert "usageError" not in row
+        assert "usageRetryAt" not in row
+
+    def test_an_unknown_row_carries_both(self):
+        row = account_row(
+            2, "b@example.com", "", "", False, None,
+            last_error="timeout", next_check_at=1_800_000_000.0,
+        )
+        assert row["usageError"] == "timeout"
+        assert row["usageLastCheckError"] == "timeout"
+        assert row["usageNextCheckAt"] == "2027-01-15T08:00:00Z"
+
+    def test_a_good_check_names_only_the_next_one(self):
+        row = account_row(
+            2, "b@example.com", "", "", False, {"five_hour": {"pct": 5.0}},
+            usage_fetched_at=1_800_000_000.0, next_check_at=1_800_000_180.0,
+        )
+        assert "usageLastCheckError" not in row
+        assert row["usageNextCheckAt"] == "2027-01-15T08:03:00Z"
+
+    def test_nothing_known_adds_nothing(self):
+        row = account_row(2, "b@example.com", "", "", False, None)
+        assert "usageLastCheckError" not in row
+        assert "usageNextCheckAt" not in row
+
+    @pytest.mark.parametrize("entry", [USAGE_TOKEN_EXPIRED, USAGE_NO_CREDENTIALS])
+    def test_explained_rows_add_nothing(self, entry):
+        row = account_row(
+            2, "b@example.com", "", "", False, entry,
+            last_error="http-429", next_check_at=1_800_000_000.0,
+        )
+        assert "usageLastCheckError" not in row
+        assert "usageNextCheckAt" not in row
 
 
 class TestAccountRowDisabled:
