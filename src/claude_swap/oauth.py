@@ -92,6 +92,25 @@ def login_expires_at_iso(credentials: str) -> str | None:
     )
 
 
+def is_setup_token(credentials: str) -> bool:
+    """Whether a stored credential is a setup-token (``claude setup-token``).
+
+    ``add_account_from_token`` stores one as an access token without a
+    refresh token, limited to inference (``SETUP_TOKEN_SCOPES``): it lasts a
+    year, never renews itself, and cannot read the account's usage.
+    """
+    try:
+        data = json.loads(credentials)
+    except (TypeError, ValueError):
+        return False
+    oauth = data.get("claudeAiOauth") if isinstance(data, dict) else None
+    if not isinstance(oauth, dict) or not oauth.get("accessToken"):
+        return False
+    if oauth.get("refreshToken"):
+        return False
+    return oauth.get("scopes") == ["user:inference"]
+
+
 def is_oauth_token_expired(expires_at: object) -> bool:
     """Return whether an OAuth token is expired or about to expire."""
     if not isinstance(expires_at, (int, float)):

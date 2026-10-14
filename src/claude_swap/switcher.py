@@ -5647,6 +5647,8 @@ class ClaudeAccountSwitcher:
             if is_active:
                 active_num = num
             entry = entries[str(num)]
+            record = seq_data.get("accounts", {}).get(str(num), {})
+            setup_token = oauth.is_setup_token(creds)
             # JSON carries the decision-grade value: last-good only while it is
             # recent enough to act on (≤ STALE_OK_S), else unavailable. Showing
             # older measurements is a human-display affordance only — scripts
@@ -5666,6 +5668,12 @@ class ClaudeAccountSwitcher:
                     disabled=self._disabled_from_data(seq_data, str(num)),
                     login_expires_at=oauth.login_expires_at_iso(creds),
                     next_check_at=entry.next_check_at(now),
+                    setup_token=setup_token,
+                    setup_token_added_at=(
+                        record.get("setupTokenAddedAt") or record.get("added")
+                        if setup_token
+                        else None
+                    ),
                 )
             )
         payload = {

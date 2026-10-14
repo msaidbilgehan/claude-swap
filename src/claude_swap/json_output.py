@@ -340,6 +340,8 @@ def account_row(
     disabled: bool = False,
     login_expires_at: str | None = None,
     next_check_at: float | None = None,
+    setup_token: bool = False,
+    setup_token_added_at: str | None = None,
 ) -> dict:
     """A full account row for ``--list``. ``backoff_until`` is the live
     backoff only; a lapsed one is the caller's to withhold.
@@ -366,6 +368,13 @@ def account_row(
     # ``relogin_required`` that follows; absent when the login carries none.
     if login_expires_at:
         row["loginExpiresAt"] = login_expires_at
+    # Additive fields: present only when the stored login is a setup-token
+    # (``oauth.is_setup_token``), which can run Claude but not read its usage
+    # and lasts a year; ``setupTokenAddedAt`` says when it was stored.
+    if setup_token:
+        row["setupToken"] = True
+        if setup_token_added_at:
+            row["setupTokenAddedAt"] = setup_token_added_at
     if usage is not None:
         row.update(usage_freshness_fields(usage_fetched_at, usage_age_s))
     else:
