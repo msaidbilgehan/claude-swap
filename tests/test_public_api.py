@@ -1840,6 +1840,44 @@ class TestUpdateSetupToken:
         assert _numbers(seeded) == [1, 2, 3]
         assert "sk-ant-oat01-two" not in caplog.text
 
+    def test_the_default_login_runs_on_the_new_token_too(self, seeded, capfd):
+        added = self._token_account(seeded)
+        api.switch_to(seeded.switcher, "ci")
+        capfd.readouterr()
+        api.add_setup_token(seeded.switcher, "sk-ant-oat01-two", account="ci")
+        _assert_silent(capfd)
+        live = json.loads(seeded.switcher._read_credentials())
+        assert live["claudeAiOauth"]["accessToken"] == "sk-ant-oat01-two"
+        assert api.active_account(seeded.switcher) == added.slot
+        # switching away backs the live login up into the account: the new one
+        api.switch_to(seeded.switcher, "1")
+        stored = seeded.switcher.read_account_credentials(added.slot, "ci@example.com")
+        assert json.loads(stored)["claudeAiOauth"]["accessToken"] == "sk-ant-oat01-two"
+
+    def test_the_same_email_again_goes_live_too(self, seeded):
+        self._token_account(seeded)
+        api.switch_to(seeded.switcher, "ci")
+        api.add_setup_token(seeded.switcher, "sk-ant-oat01-two", email="ci@example.com")
+        live = json.loads(seeded.switcher._read_credentials())
+        assert live["claudeAiOauth"]["accessToken"] == "sk-ant-oat01-two"
+
+    def test_the_old_token_stays_when_the_default_login_cannot_take_it(
+        self, seeded, monkeypatch
+    ):
+        added = self._token_account(seeded)
+        api.switch_to(seeded.switcher, "ci")
+        before = self._added_at(seeded, added.slot)
+
+        def refuse(*_args, **_kwargs):
+            raise api.SwitchError("the keychain refused the write")
+
+        monkeypatch.setattr(seeded.switcher, "switch_to", refuse)
+        with pytest.raises(api.SwitchError, match="keychain refused"):
+            api.add_setup_token(seeded.switcher, "sk-ant-oat01-two", account="ci")
+        stored = seeded.switcher.read_account_credentials(added.slot, "ci@example.com")
+        assert json.loads(stored)["claudeAiOauth"]["accessToken"] == "sk-ant-oat01-one"
+        assert self._added_at(seeded, added.slot) == before
+
     def test_a_placeholder_email_works_by_slot(self, seeded):
         added = api.add_setup_token(seeded.switcher, "sk-ant-oat01-one")
         again = api.add_setup_token(seeded.switcher, "sk-ant-oat01-two", account="3")

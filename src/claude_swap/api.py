@@ -1168,11 +1168,18 @@ def add_setup_token(
     refused, as a setup-token cannot show whose it is, and so is the token
     the account has already.
 
+    When Claude Code's default profile runs on the account that gets a new
+    token (either way), the new token goes into the default profile too
+    (sak.10); if it cannot, the account keeps its old token and the error is
+    raised.
+
     Raises :class:`ValidationError` for an empty value, an API key, anything
     that is not a setup-token, a bad email, a bad or taken alias, or an
     ``account`` that cannot take it; :class:`AccountNotFoundError` for an
     unknown ``account`` and :class:`CredentialReadError` when its stored
-    login cannot be read now. Never prompts and never prints the token.
+    login cannot be read now; a switch's errors (:class:`SwitchError`, …)
+    when the default profile cannot take the new token. Never prompts and
+    never prints the token.
     """
     _refuse_foreign_profile()
     value = token.strip()
@@ -1201,7 +1208,10 @@ def add_setup_token(
         label = email.strip() if email else None
         existing = _setup_token_slot(switcher, label) if label else None
         normalized = _free_alias(switcher, alias, existing)
+        live = _live_setup_token(switcher, existing, label)
         switcher.add_account_from_token(value, email=label, assume_yes=True)
+        if live is not None:
+            _activate_new_token(switcher, live)
         data = switcher._get_sequence_data() or {}
         accounts = data.get("accounts", {})
         if label:
@@ -1236,6 +1246,42 @@ def _stored_login(switcher: ClaudeAccountSwitcher, slot: str, email: str) -> str
     return stored
 
 
+@dataclass(frozen=True)
+class _LiveToken:
+    """The setup-token account the default profile runs on, and its token."""
+
+    slot: str
+    email: str
+    stored: str
+
+
+def _live_setup_token(
+    switcher: ClaudeAccountSwitcher, slot: str | None, email: str | None
+) -> _LiveToken | None:
+    """The setup-token account ``slot`` with what it stores, when the default
+    profile runs on it (its new token has to go live too); None otherwise."""
+    if slot is None or email is None:
+        return None
+    if switcher._get_current_account() != (email, ""):
+        return None
+    return _LiveToken(slot, email, _stored_login(switcher, slot, email))
+
+
+def _activate_new_token(switcher: ClaudeAccountSwitcher, live: _LiveToken) -> None:
+    """Put the account's new setup-token into the default profile, which runs
+    on it: a switch away backs the live login up into the account, and would
+    put the old token back over the new one. When the default profile cannot
+    take it, the account gets back the token it runs on, and the error is
+    raised."""
+    activated = False
+    try:
+        switcher.switch_to(live.slot, json_output=True, force=True)
+        activated = True
+    finally:
+        if not activated and live.stored:
+            switcher._write_account_credentials(live.slot, live.email, live.stored)
+
+
 def _replace_setup_token(
     switcher: ClaudeAccountSwitcher, account: str, value: str
 ) -> AddedAccount:
@@ -1256,7 +1302,10 @@ def _replace_setup_token(
             f"Account {slot} ({email}) has this setup-token already; nothing "
             "changed."
         )
+    live = _live_setup_token(switcher, slot, email)
     switcher.add_account_from_token(value, email=email, assume_yes=True)
+    if live is not None:
+        _activate_new_token(switcher, live)
     data = switcher._get_sequence_data() or {}
     if switcher._find_account_slot(data, email, "") != slot:  # pragma: no cover
         raise ConfigError(f"The setup-token was not stored for account {slot}.")
