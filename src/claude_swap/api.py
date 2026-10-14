@@ -41,6 +41,7 @@ from importlib.metadata import version as _dist_version
 from pathlib import Path
 from typing import Any, NamedTuple
 
+from claude_swap import oauth
 from claude_swap.autoswitch import (
     AllExhaustedEvent,
     AutoSwitcherInstance,
@@ -98,6 +99,7 @@ __all__ = [
     "ClaudeSwitchError",
     "ConfigError",
     "ConfigWarningEvent",
+    "CopiedLogin",
     "CredentialError",
     "ErrorEvent",
     "LockError",
@@ -120,6 +122,7 @@ __all__ = [
     "accounts_json",
     "active_account",
     "add_current_login",
+    "add_login_copy",
     "add_profile_login",
     "add_setup_token",
     "check_login_source",
@@ -245,10 +248,26 @@ class MovedLogin(NamedTuple):
     """Why the old copy could not be removed; it no longer works anyway."""
 
 
+class CopiedLogin(NamedTuple):
+    """What :func:`add_login_copy` did (sak.8)."""
+
+    account: AddedAccount
+    """The account the copy was registered as (``created`` False: an account
+    already managed got it as its stored login)."""
+    default_login: bool
+    """The login is the account Claude Code's default profile is logged in
+    to: that account keeps following the live login, and the copy was not
+    stored."""
+    renewed: bool
+    """The copy's access token had lapsed and was renewed first: the copy it
+    came from no longer works."""
+
+
 class LoginNotAddedError(CredentialError):
-    """Claude Code moved the login into ``config_dir``, but it could not be
-    registered: that profile holds the only working copy now. Fix the cause
-    and import from ``config_dir``; do not discard it."""
+    """Claude Code moved the login into ``config_dir`` (or a copy was renewed
+    there), but it could not be registered: that profile holds the only
+    working copy now. Fix the cause and import from ``config_dir``; do not
+    discard it."""
 
     def __init__(self, message: str, config_dir: str) -> None:
         super().__init__(message)
@@ -791,9 +810,11 @@ def _read_file_credentials(path: Path) -> str:
         raise CredentialReadError(f"Cannot read {path}: {e}") from e
 
 
-def _movable(credentials: str, where: str) -> tuple[str, tuple[str, ...], str | None]:
-    """The refresh token, scopes and login expiry of a login that can move;
-    refuses anything else."""
+def _movable(
+    credentials: str, where: str, verb: str = "move"
+) -> tuple[str, tuple[str, ...], str | None]:
+    """The refresh token, scopes and login expiry of a login Claude Code can
+    ``verb`` (move, or use as a copy); refuses anything else."""
     if looks_like_api_key(credentials):
         raise ValidationError(f"{where} holds an API key, not a Claude login.")
     entry = _oauth_entry(credentials)
@@ -818,8 +839,8 @@ def _movable(credentials: str, where: str) -> tuple[str, tuple[str, ...], str | 
         and 0 < expires <= time.time() * 1000
     ):
         raise ValidationError(
-            f"The login in {where} expired on {login_expires_at_iso(credentials)}; "
-            "log in again instead."
+            f"{where} holds a login that expired on "
+            f"{login_expires_at_iso(credentials)}; log in again instead."
         )
     scopes = entry.get("scopes")
     if (
@@ -829,7 +850,7 @@ def _movable(credentials: str, where: str) -> tuple[str, tuple[str, ...], str | 
     ):
         raise ValidationError(
             f"{where} does not record the login's scopes, which Claude Code needs "
-            "to move it."
+            f"to {verb} it."
         )
     return refresh.strip(), tuple(scopes), login_expires_at_iso(credentials)
 
@@ -947,15 +968,18 @@ def _free_alias(
 
 
 def _empty_profile(
-    switcher: ClaudeAccountSwitcher, config_dir: str | os.PathLike[str], found: _Found
+    switcher: ClaudeAccountSwitcher,
+    config_dir: str | os.PathLike[str],
+    source: str | None,
+    verb: str = "move",
 ) -> str:
     target = os.fspath(config_dir)
     path = Path(target)
     if not path.is_dir():
-        raise ConfigError(f"The profile to move the login into, {target}, is missing.")
+        raise ConfigError(f"The profile to {verb} the login into, {target}, is missing.")
     _refuse_own_store(switcher, path)
-    if _inside(path, Path(found.info.path)) or _inside(Path(found.info.path), path):
-        raise ConfigError("The login cannot move into the folder it comes from.")
+    if source is not None and (_inside(path, Path(source)) or _inside(Path(source), path)):
+        raise ConfigError("The login cannot go into the folder it comes from.")
     if read_config_dir_credentials(target) or _profile_identity(path) is not None:
         raise ConfigError(f"The profile {target} holds a login already.")
     return target
@@ -1070,7 +1094,7 @@ def import_login(
     with _quiet():
         found = _find_login(switcher, source)
         alias = _free_alias(switcher, alias, found.info.slot)
-        target = _empty_profile(switcher, config_dir, found)
+        target = _empty_profile(switcher, config_dir, found.info.path)
     # Outside the output lock: Claude Code may take a while, and every other
     # call of this module waits for that lock.
     _exchange(found, target, claude)
@@ -1177,3 +1201,189 @@ def add_setup_token(
         switcher._write_json(switcher.sequence_file, data)
         stored_email = str(record.get("email", label or ""))
     return AddedAccount(slot=slot, email=stored_email, created=created)
+
+
+# -- copying a login in (sak.8) -----------------------------------------------------
+
+_GIVEN = "The text given"
+"""How :func:`add_login_copy`'s messages name credentials given as text."""
+
+
+def _copy_source(
+    switcher: ClaudeAccountSwitcher,
+    credentials: str | None,
+    source: str | os.PathLike[str] | None,
+) -> tuple[str, str, str | None]:
+    """``(where, credentials, path)``: the login to copy, how messages name
+    it, and the file it was read from (``None`` for text)."""
+    if (credentials is None) == (source is None):
+        raise ConfigError("Give either the credentials or a credentials file.")
+    if credentials is not None:
+        if len(credentials) > _MAX_CREDENTIALS_BYTES:
+            raise ValidationError(f"{_GIVEN} is too big to be a Claude login.")
+        return _GIVEN, credentials.strip(), None
+    raw = os.path.expanduser(os.fspath(source)).strip()
+    if not raw:
+        raise ConfigError("Name a credentials file.")
+    path = Path(raw)
+    if not path.exists():
+        raise ConfigError(f"{raw} does not exist.")
+    _refuse_own_store(switcher, path)
+    if not path.is_file():
+        raise ConfigError(f"{raw} is not a file; name a Claude Code credentials file.")
+    return raw, _read_file_credentials(path).strip(), raw
+
+
+def _live_access_token(credentials: str) -> str | None:
+    """The access token, unless it is missing or has lapsed."""
+    entry = _oauth_entry(credentials) or {}
+    token = entry.get("accessToken")
+    if not isinstance(token, str) or not token.strip():
+        return None
+    if oauth.is_oauth_token_expired(entry.get("expiresAt")):
+        return None
+    return token.strip()
+
+
+def _keep_copy(target: str, credentials: str) -> None:
+    """Store the copy as Claude Code keeps a profile's login outside the
+    macOS Keychain: ``.credentials.json``, readable by its owner only."""
+    path = Path(target) / ".credentials.json"
+    temporary = path.with_name(".credentials.json.tmp")
+    try:
+        fd = os.open(temporary, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+        with os.fdopen(fd, "w", encoding="utf-8") as f:
+            f.write(credentials)
+        os.replace(temporary, path)
+    except OSError as e:
+        raise CredentialError(f"Could not keep the login in {target}: {e}") from e
+
+
+def _renew(credentials: str, where: str) -> str:
+    """The copy with a new access token. Its refresh token is spent then, so
+    the copy it came from no longer works."""
+    outcome = oauth.try_refresh_oauth_credentials(credentials)
+    if outcome.credentials is not None:
+        return outcome.credentials
+    if outcome.error == "invalid_grant":
+        raise CredentialError(
+            f"{where} holds a login that no longer works: it was renewed, moved or "
+            "logged out elsewhere since this copy was made. Log in again instead."
+        )
+    raise CredentialError(
+        f"{where} holds a login whose access has lapsed, and it could not be "
+        f"renewed now ({outcome.error}); check the connection and try again."
+    )
+
+
+def _copy_identity(target: str, credentials: str) -> tuple[str, str]:
+    """Ask Anthropic whose login it is, and record that in the target profile
+    as Claude Code does (``oauthAccount``). Returns ``(email, organization)``."""
+    token = _live_access_token(credentials)
+    profile = oauth.fetch_oauth_profile(token) if token else None
+    email = profile.get("email") if profile else None
+    org_uuid = profile.get("organizationUuid") if profile else None
+    if not profile or not email or not org_uuid:
+        raise CredentialError(
+            "Anthropic did not say whose login this is (offline, or the login "
+            "no longer works); try again later."
+        )
+    account = {
+        "accountUuid": profile["uuid"],
+        "emailAddress": email,
+        "organizationUuid": org_uuid,
+        "organizationName": profile.get("organizationName"),
+    }
+    try:
+        (Path(target) / ".claude.json").write_text(
+            json.dumps({"oauthAccount": account}), encoding="utf-8"
+        )
+    except OSError as e:
+        raise CredentialError(f"Could not record the account in {target}: {e}") from e
+    return email, org_uuid
+
+
+def add_login_copy(
+    switcher: ClaudeAccountSwitcher,
+    config_dir: str | os.PathLike[str],
+    *,
+    credentials: str | None = None,
+    source: str | os.PathLike[str] | None = None,
+    alias: str | None = None,
+) -> CopiedLogin:
+    """Register a copy of a Claude login: the credentials JSON Claude Code
+    keeps (``{"claudeAiOauth": ...}``), given as text (``credentials``) or as
+    a credentials file (``source``, read here and left as it is). Exactly one
+    of the two.
+
+    Unlike :func:`import_login`, nothing moves: both copies work until either
+    renews the login, and from then on only that one does (each refresh
+    token works once). Use the copy only here. The credentials name no
+    account, so Anthropic is asked whose login it is (``/api/oauth/profile``,
+    with its access token); when that token has lapsed, the login is renewed
+    first, and the copy it came from stops working right away.
+
+    The copy is kept in ``config_dir``, an empty, temporary profile the
+    caller owns, and registered as :func:`add_profile_login` registers a
+    login: a new account takes the next free slot with ``alias``; an account
+    already managed gets it as its stored login; the account the default
+    profile is logged in to keeps following its live login.
+    ``config_dir`` keeps the copy until :func:`forget_profile_login`.
+
+    Raises :class:`ConfigError` for neither or both of ``credentials`` and
+    ``source``, a missing file, a folder, the default profile, claude-swap's
+    own store, or a login that is managed already; :class:`ValidationError`
+    for a bare token, an API key, a setup-token, a logged-out or expired
+    login, one without its scopes, or a bad alias or one another account
+    uses; :class:`CredentialError` when the file cannot be read, the login
+    cannot be renewed, or Anthropic does not say whose it is. Nothing is
+    registered then, and unless the login was renewed nothing changed. A
+    renewed copy that cannot be registered raises
+    :class:`LoginNotAddedError`: ``config_dir`` holds the only working copy.
+    Never prompts; the tokens are never printed or logged.
+    """
+    _refuse_foreign_profile()
+    with _quiet():
+        where, copy, path = _copy_source(switcher, credentials, source)
+        if copy.startswith(SETUP_TOKEN_PREFIX):
+            raise ValidationError(
+                f"{where} is a bare token, not a login's credentials (the JSON "
+                "with claudeAiOauth); register a setup-token as one."
+            )
+        _movable(copy, where, "use")
+        _refuse_managed_grant(switcher, credential_fingerprint(copy) or "", where)
+        alias = _free_alias(switcher, alias, None)
+        target = _empty_profile(switcher, config_dir, path, "copy")
+        _keep_copy(target, copy)
+    # Outside the output lock: Anthropic may take a while to answer, and
+    # every other call of this module waits for that lock.
+    renewed = False
+    if _live_access_token(copy) is None:
+        copy = _renew(copy, where)
+        renewed = True
+        try:
+            _keep_copy(target, copy)  # the only working copy from here on
+        except CredentialError as e:
+            raise CredentialError(
+                f"{e}. The login was renewed, so the copy it came from no longer "
+                "works: log in again."
+            ) from e
+    try:
+        identity = _copy_identity(target, copy)
+        with _quiet():
+            default_login = switcher._get_current_account() == identity
+            slot, created = switcher.add_account_from_profile(target, alias=alias)
+            email = switcher.account_email(slot)
+    except ClaudeSwitchError as e:
+        if not renewed:
+            raise
+        raise LoginNotAddedError(
+            f"The login was renewed into {target}, but it could not be "
+            f"registered: {e}",
+            target,
+        ) from e
+    return CopiedLogin(
+        account=AddedAccount(slot=slot, email=email, created=created),
+        default_login=default_login,
+        renewed=renewed,
+    )

@@ -1254,13 +1254,14 @@ class TestFetchOauthProfile:
             seen["auth"] = req.headers.get("Authorization")
             return self._profile_response({
                 "account": {"uuid": "acc-uuid", "email": "a@b.c"},
-                "organization": {"uuid": "org-uuid"},
+                "organization": {"uuid": "org-uuid", "name": "Acme"},
             })
 
         with patch("claude_swap.oauth.urllib.request.urlopen", side_effect=mock_urlopen):
             result = oauth.fetch_oauth_profile("sk-live")
         assert result == {
             "uuid": "acc-uuid", "email": "a@b.c", "organizationUuid": "org-uuid",
+            "organizationName": "Acme",
         }
         assert seen["url"].endswith("/api/oauth/profile")
         assert seen["auth"] == "Bearer sk-live"
@@ -1356,18 +1357,24 @@ class TestFetchOauthProfile:
             }),
         ):
             result = oauth.fetch_oauth_profile("sk-live")
-        assert result == {"uuid": "acc-uuid", "email": None, "organizationUuid": None}
+        assert result == {
+            "uuid": "acc-uuid", "email": None, "organizationUuid": None,
+            "organizationName": None,
+        }
 
     def test_non_string_optional_fields_are_dropped_not_fatal(self):
         with patch(
             "claude_swap.oauth.urllib.request.urlopen",
             return_value=self._profile_response({
                 "account": {"uuid": "acc-uuid", "email": {"weird": True}},
-                "organization": {"uuid": 99},
+                "organization": {"uuid": 99, "name": 7},
             }),
         ):
             result = oauth.fetch_oauth_profile("sk-live")
-        assert result == {"uuid": "acc-uuid", "email": None, "organizationUuid": None}
+        assert result == {
+            "uuid": "acc-uuid", "email": None, "organizationUuid": None,
+            "organizationName": None,
+        }
 
     def test_401_is_unresolvable_with_log_file_warning(self, caplog):
         """401 is evidence (the live token can't authenticate) but not proof —

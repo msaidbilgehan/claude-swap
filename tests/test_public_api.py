@@ -21,6 +21,7 @@ from claude_swap import api
 from claude_swap.autoswitch import AutoSwitchEngine
 from claude_swap.mappings import MappingStore
 from claude_swap.models import Platform
+from claude_swap.oauth import RefreshOutcome
 from tests.test_autoswitch import EngineHarness
 
 EXPECTED_ALL = [
@@ -36,6 +37,7 @@ EXPECTED_ALL = [
     "ClaudeSwitchError",
     "ConfigError",
     "ConfigWarningEvent",
+    "CopiedLogin",
     "CredentialError",
     "ErrorEvent",
     "LockError",
@@ -58,6 +60,7 @@ EXPECTED_ALL = [
     "accounts_json",
     "active_account",
     "add_current_login",
+    "add_login_copy",
     "add_profile_login",
     "add_setup_token",
     "check_login_source",
@@ -135,6 +138,12 @@ EXPECTED_SIGNATURES = {
         "(switcher: 'ClaudeAccountSwitcher', source: 'str | os.PathLike[str]', "
         "config_dir: 'str | os.PathLike[str]', *, alias: 'str | None' = None, "
         "claude: 'str | os.PathLike[str] | None' = None) -> 'MovedLogin'"
+    ),
+    "add_login_copy": (
+        "(switcher: 'ClaudeAccountSwitcher', config_dir: 'str | os.PathLike[str]', *, "
+        "credentials: 'str | None' = None, "
+        "source: 'str | os.PathLike[str] | None' = None, "
+        "alias: 'str | None' = None) -> 'CopiedLogin'"
     ),
     "add_setup_token": (
         "(switcher: 'ClaudeAccountSwitcher', token: 'str', *, "
@@ -1423,3 +1432,373 @@ class TestSetupToken:
         monkeypatch.setenv("CLAUDE_CONFIG_DIR", str(tmp_path / "hand-made"))
         with pytest.raises(api.ConfigError, match="CLAUDE_CONFIG_DIR"):
             api.add_setup_token(seeded.switcher, "sk-ant-oat01-x")
+
+
+_FRESH = 4102444800000
+"""2100-01-01, in epoch milliseconds."""
+
+
+def _copy_text(
+    refresh: str | None = "sk-ant-ort01-copy",
+    access: str | None = "sk-ant-oat01-copy",
+    **extra,
+) -> str:
+    entry = {
+        "accessToken": access,
+        "refreshToken": refresh,
+        "expiresAt": _FRESH,
+        "scopes": _SCOPES,
+        **extra,
+    }
+    return json.dumps({"claudeAiOauth": {k: v for k, v in entry.items() if v is not None}})
+
+
+def _owner(num: int, email: str, org: str | None, name: str | None = None) -> dict:
+    return {
+        "uuid": f"uuid-{num}",
+        "email": email,
+        "organizationUuid": org,
+        "organizationName": name,
+    }
+
+
+def _give_org(seeded, num: int, org: str) -> None:
+    data = seeded.switcher._get_sequence_data()
+    data["accounts"][str(num)]["organizationUuid"] = org
+    seeded.switcher._write_json(seeded.switcher.sequence_file, data)
+
+
+def _numbers(seeded) -> list[int]:
+    return [r["number"] for r in api.accounts_json(seeded.switcher)["accounts"]]
+
+
+class _Anthropic:
+    """Anthropic's side of a copy: whose each access token is, and renewals."""
+
+    def __init__(self) -> None:
+        owner = _owner(3, "c@example.com", "org-3", "Acme")
+        self.owners: dict[str, dict | None] = {
+            "sk-ant-oat01-copy": owner,
+            "sk-ant-oat01-renewed": owner,
+        }
+        self.asked: list[str] = []
+        self.renewals: list[str] = []
+        self.renewal: str | None = None
+
+    def profile(self, token: str) -> dict | None:
+        self.asked.append(token)
+        return self.owners.get(token)
+
+    def refresh(self, credentials: str, timeout_s: float = 10.0) -> RefreshOutcome:
+        self.renewals.append(credentials)
+        if self.renewal is not None:
+            return RefreshOutcome(None, self.renewal)
+        data = json.loads(credentials)
+        data["claudeAiOauth"].update(
+            accessToken="sk-ant-oat01-renewed",
+            refreshToken="sk-ant-ort01-renewed",
+            expiresAt=_FRESH,
+        )
+        return RefreshOutcome(json.dumps(data), None)
+
+
+class TestLoginCopy:
+    """Copying a login in as it is, the source left alone (sak.8)."""
+
+    @pytest.fixture
+    def anthropic(self, monkeypatch) -> _Anthropic:
+        fake = _Anthropic()
+        monkeypatch.setattr("claude_swap.oauth.fetch_oauth_profile", fake.profile)
+        monkeypatch.setattr("claude_swap.oauth.try_refresh_oauth_credentials", fake.refresh)
+        return fake
+
+    def test_copies_a_file_into_a_new_account(
+        self, seeded, tmp_path, temp_home, target, anthropic, capfd, caplog
+    ):
+        default_before = (temp_home / ".claude" / ".credentials.json").read_text()
+        source = tmp_path / "copy" / ".credentials.json"
+        source.parent.mkdir()
+        source.write_text(_copy_text() + "\n")
+        before = source.read_text()
+        capfd.readouterr()
+        copied = api.add_login_copy(seeded.switcher, target, source=source, alias="Work")
+        _assert_silent(capfd)
+        assert copied == api.CopiedLogin(
+            account=api.AddedAccount(slot="3", email="c@example.com", created=True),
+            default_login=False,
+            renewed=False,
+        )
+        assert api.CopiedLogin._fields == ("account", "default_login", "renewed")
+        assert source.read_text() == before
+        assert anthropic.renewals == []
+        assert seeded.switcher.read_account_credentials("3", "c@example.com") == (
+            _copy_text()
+        )
+        rows = {r["number"]: r for r in api.accounts_json(seeded.switcher)["accounts"]}
+        assert rows[3]["email"] == "c@example.com"
+        assert rows[3]["organizationUuid"] == "org-3"
+        assert rows[3]["organizationName"] == "Acme"
+        assert rows[3].get("alias") == "work"
+        assert api.active_account(seeded.switcher) == "1"
+        assert (temp_home / ".claude" / ".credentials.json").read_text() == default_before
+        kept = target / ".credentials.json"
+        assert kept.read_text() == _copy_text()
+        if os.name != "nt":
+            assert kept.stat().st_mode & 0o777 == 0o600
+        assert json.loads((target / ".claude.json").read_text()) == {
+            "oauthAccount": {
+                "accountUuid": "uuid-3",
+                "emailAddress": "c@example.com",
+                "organizationUuid": "org-3",
+                "organizationName": "Acme",
+            }
+        }
+        assert "sk-ant-ort01-copy" not in caplog.text
+        assert "sk-ant-oat01-copy" not in caplog.text
+
+    def test_copies_text_as_given(self, seeded, target, anthropic):
+        copied = api.add_login_copy(
+            seeded.switcher, target, credentials="\n  " + _copy_text() + "\n"
+        )
+        assert copied.account == api.AddedAccount(
+            slot="3", email="c@example.com", created=True
+        )
+        assert copied.renewed is False
+        assert seeded.switcher.read_account_credentials("3", "c@example.com") == (
+            _copy_text()
+        )
+        assert anthropic.asked[0] == "sk-ant-oat01-copy"
+
+    @pytest.mark.parametrize("lapsed", [{"expiresAt": 1_000}, {"access": None}])
+    def test_a_lapsed_access_token_is_renewed_first(
+        self, seeded, target, anthropic, caplog, lapsed
+    ):
+        text = _copy_text(**lapsed)
+        copied = api.add_login_copy(seeded.switcher, target, credentials=text)
+        assert copied.renewed is True
+        assert copied.account.slot == "3"
+        assert anthropic.renewals == [text]
+        assert anthropic.asked[0] == "sk-ant-oat01-renewed"
+        stored = seeded.switcher.read_account_credentials("3", "c@example.com")
+        assert "sk-ant-ort01-renewed" in stored
+        assert "sk-ant-ort01-renewed" in (target / ".credentials.json").read_text()
+        assert "sk-ant-ort01-renewed" not in caplog.text
+
+    @pytest.mark.parametrize(
+        ("error", "match"),
+        [
+            ("invalid_grant", "no longer works"),
+            ("transient", "could not be renewed now \\(transient\\)"),
+        ],
+    )
+    def test_a_login_that_cannot_be_renewed_is_refused(
+        self, seeded, target, anthropic, error, match
+    ):
+        anthropic.renewal = error
+        with pytest.raises(api.CredentialError, match=match) as raised:
+            api.add_login_copy(
+                seeded.switcher, target, credentials=_copy_text(expiresAt=1_000)
+            )
+        assert not isinstance(raised.value, api.LoginNotAddedError)
+        assert anthropic.asked == []
+        assert _numbers(seeded) == [1, 2]
+
+    @pytest.mark.parametrize(
+        "owner",
+        [
+            None,
+            _owner(3, None, "org-3"),
+            _owner(3, "c@example.com", None),
+        ],
+    )
+    def test_a_login_anthropic_cannot_place_is_refused(
+        self, seeded, target, anthropic, owner
+    ):
+        anthropic.owners["sk-ant-oat01-copy"] = owner
+        with pytest.raises(api.CredentialError, match="did not say whose login") as raised:
+            api.add_login_copy(seeded.switcher, target, credentials=_copy_text())
+        assert not isinstance(raised.value, api.LoginNotAddedError)
+        assert _numbers(seeded) == [1, 2]
+
+    def test_a_renewed_copy_anthropic_cannot_place_is_kept(
+        self, seeded, target, anthropic
+    ):
+        anthropic.owners["sk-ant-oat01-renewed"] = None
+        with pytest.raises(api.LoginNotAddedError, match="did not say whose") as raised:
+            api.add_login_copy(
+                seeded.switcher, target, credentials=_copy_text(expiresAt=1_000)
+            )
+        assert raised.value.config_dir == str(target)
+        assert "sk-ant-ort01-renewed" in (target / ".credentials.json").read_text()
+        assert _numbers(seeded) == [1, 2]
+
+    def test_a_renewed_copy_that_cannot_be_registered_is_kept(
+        self, seeded, target, anthropic, monkeypatch
+    ):
+        def refuse(*_a, **_k):
+            raise api.CredentialError("the keychain is locked")
+
+        monkeypatch.setattr(seeded.switcher, "add_account_from_profile", refuse)
+        with pytest.raises(api.LoginNotAddedError, match="keychain is locked") as raised:
+            api.add_login_copy(
+                seeded.switcher, target, credentials=_copy_text(expiresAt=1_000)
+            )
+        assert raised.value.config_dir == str(target)
+        assert "sk-ant-ort01-renewed" in (target / ".credentials.json").read_text()
+
+    def test_a_copy_that_cannot_be_registered_changes_nothing(
+        self, seeded, target, anthropic, monkeypatch
+    ):
+        def refuse(*_a, **_k):
+            raise api.CredentialError("the keychain is locked")
+
+        monkeypatch.setattr(seeded.switcher, "add_account_from_profile", refuse)
+        with pytest.raises(api.CredentialError, match="keychain is locked") as raised:
+            api.add_login_copy(seeded.switcher, target, credentials=_copy_text())
+        assert not isinstance(raised.value, api.LoginNotAddedError)
+        assert anthropic.renewals == []
+
+    def test_an_account_managed_already_gets_the_copy(self, seeded, target, anthropic):
+        _give_org(seeded, 2, "org-2")
+        api.set_alias(seeded.switcher, "2", "side")
+        anthropic.owners["sk-ant-oat01-copy"] = _owner(2, "b@example.com", "org-2")
+        copied = api.add_login_copy(
+            seeded.switcher, target, credentials=_copy_text(), alias="other"
+        )
+        assert copied.account == api.AddedAccount(
+            slot="2", email="b@example.com", created=False
+        )
+        assert copied.default_login is False
+        assert seeded.switcher.read_account_credentials("2", "b@example.com") == (
+            _copy_text()
+        )
+        rows = {r["number"]: r for r in api.accounts_json(seeded.switcher)["accounts"]}
+        assert rows[2].get("alias") == "side"
+        assert _numbers(seeded) == [1, 2]
+
+    def test_the_default_logins_account_keeps_its_live_login(
+        self, seeded, temp_home, target, anthropic
+    ):
+        _give_org(seeded, 1, "org-1")
+        (temp_home / ".claude.json").write_text(json.dumps({
+            "oauthAccount": {
+                "emailAddress": "a@example.com",
+                "accountUuid": "uuid-1",
+                "organizationUuid": "org-1",
+            },
+        }))
+        before = seeded.switcher.read_account_credentials("1", "a@example.com")
+        anthropic.owners["sk-ant-oat01-copy"] = _owner(1, "a@example.com", "org-1")
+        copied = api.add_login_copy(seeded.switcher, target, credentials=_copy_text())
+        assert copied.default_login is True
+        assert copied.account == api.AddedAccount(
+            slot="1", email="a@example.com", created=False
+        )
+        assert seeded.switcher.read_account_credentials("1", "a@example.com") == before
+
+    @pytest.mark.parametrize(
+        ("content", "match"),
+        [
+            ("sk-ant-api03-key", "API key"),
+            ("sk-ant-oat01-bare", "bare token"),
+            ('{"other": 1}', "no Claude login"),
+            ("not json", "no Claude login"),
+            (
+                json.dumps({"claudeAiOauth": {
+                    "accessToken": "sk-ant-oat01-t", "scopes": ["user:inference"],
+                }}),
+                "setup-token",
+            ),
+            (_copy_text(refresh=None), "logged out or emptied"),
+            (
+                _copy_text(refreshTokenExpiresAt=1_000),
+                "holds a login that expired on 1970-01-01T00:00:01Z",
+            ),
+            (_copy_text(scopes=None), "needs to use it"),
+        ],
+    )
+    def test_refuses_what_cannot_be_copied(
+        self, seeded, target, anthropic, content, match
+    ):
+        with pytest.raises(api.ValidationError, match=match) as raised:
+            api.add_login_copy(seeded.switcher, target, credentials=content)
+        assert str(raised.value).startswith("The text given ")
+        assert anthropic.asked == []
+        assert anthropic.renewals == []
+        assert not (target / ".credentials.json").exists()
+        assert _numbers(seeded) == [1, 2]
+
+    def test_refuses_what_is_not_one_credentials_file(
+        self, seeded, tmp_path, temp_home, target, anthropic
+    ):
+        with pytest.raises(api.ConfigError, match="either the credentials or"):
+            api.add_login_copy(seeded.switcher, target)
+        with pytest.raises(api.ConfigError, match="either the credentials or"):
+            api.add_login_copy(
+                seeded.switcher, target, credentials=_copy_text(), source=tmp_path
+            )
+        with pytest.raises(api.ConfigError, match="does not exist"):
+            api.add_login_copy(seeded.switcher, target, source=tmp_path / "gone.json")
+        with pytest.raises(api.ConfigError, match="Name a credentials file"):
+            api.add_login_copy(seeded.switcher, target, source="  ")
+        folder = tmp_path / "folder"
+        folder.mkdir()
+        with pytest.raises(api.ConfigError, match="not a file"):
+            api.add_login_copy(seeded.switcher, target, source=folder)
+        with pytest.raises(api.ConfigError, match="default profile"):
+            api.add_login_copy(
+                seeded.switcher,
+                target,
+                source=temp_home / ".claude" / ".credentials.json",
+            )
+        with pytest.raises(api.ValidationError, match="too big"):
+            api.add_login_copy(
+                seeded.switcher, target, credentials="x" * ((1 << 20) + 1)
+            )
+        assert anthropic.asked == []
+
+    def test_refuses_a_login_that_is_managed_already(self, seeded, target, anthropic):
+        stored = seeded.switcher.read_account_credentials("2", "b@example.com")
+        copy = stored.replace('"refreshToken"', '"scopes": ["x"], "refreshToken"')
+        with pytest.raises(api.ConfigError, match="account 2 \\(b@example.com\\)"):
+            api.add_login_copy(seeded.switcher, target, credentials=copy)
+        live = json.dumps({"claudeAiOauth": {
+            "accessToken": "sk-other", "refreshToken": "rt-live", "scopes": _SCOPES,
+        }})
+        with pytest.raises(api.ConfigError, match="default profile uses now"):
+            api.add_login_copy(seeded.switcher, target, credentials=live)
+        assert anthropic.asked == []
+
+    def test_a_taken_alias_is_refused_before_anything_happens(
+        self, seeded, target, anthropic
+    ):
+        api.set_alias(seeded.switcher, "1", "main")
+        with pytest.raises(api.ValidationError, match="already used by account 1"):
+            api.add_login_copy(
+                seeded.switcher,
+                target,
+                credentials=_copy_text(expiresAt=1_000),
+                alias="main",
+            )
+        assert anthropic.renewals == []
+        assert anthropic.asked == []
+        assert not (target / ".credentials.json").exists()
+
+    def test_the_target_must_be_an_empty_profile(
+        self, seeded, tmp_path, anthropic
+    ):
+        with pytest.raises(api.ConfigError, match="profile to copy the login into"):
+            api.add_login_copy(
+                seeded.switcher, tmp_path / "nowhere", credentials=_copy_text()
+            )
+        busy = _profile_login(tmp_path / "busy", "d@example.com", "uuid-4")
+        with pytest.raises(api.ConfigError, match="holds a login already"):
+            api.add_login_copy(seeded.switcher, busy, credentials=_copy_text())
+        assert anthropic.asked == []
+
+    def test_refuses_a_foreign_profile(
+        self, seeded, tmp_path, target, anthropic, monkeypatch
+    ):
+        monkeypatch.setenv("CLAUDE_CONFIG_DIR", str(tmp_path / "hand-made"))
+        with pytest.raises(api.ConfigError, match="CLAUDE_CONFIG_DIR"):
+            api.add_login_copy(seeded.switcher, target, credentials=_copy_text())

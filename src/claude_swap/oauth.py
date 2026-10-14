@@ -286,7 +286,7 @@ def fetch_oauth_profile(access_token: str) -> dict | None:
 
     ``GET /api/oauth/profile`` answers the one question the credential bytes
     can't: *whose* token is this. Returns ``{"uuid", "email",
-    "organizationUuid"}`` or None on any failure — callers treat None as
+    "organizationUuid", "organizationName"}`` or None on any failure — callers treat None as
     "unresolvable", never as an error. The identity oracle is strictly
     advisory (a switch proceeds pre-fix on None), so the boundary is strict
     the other way: a response counts as resolved only when it carries a
@@ -336,10 +336,12 @@ def fetch_oauth_profile(access_token: str) -> dict | None:
     email = account.get("email")
     organization = data.get("organization")
     org_uuid = organization.get("uuid") if isinstance(organization, dict) else None
+    org_name = organization.get("name") if isinstance(organization, dict) else None
     return {
         "uuid": uuid.strip(),
         "email": email if isinstance(email, str) else None,
         "organizationUuid": org_uuid if isinstance(org_uuid, str) else None,
+        "organizationName": org_name if isinstance(org_name, str) else None,
     }
 
 
