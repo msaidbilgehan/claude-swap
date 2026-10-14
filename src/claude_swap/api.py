@@ -1147,6 +1147,7 @@ def add_setup_token(
     *,
     email: str | None = None,
     alias: str | None = None,
+    account: str | None = None,
 ) -> AddedAccount:
     """Register a setup-token (``claude setup-token``) as an account: the
     silent ``cswap add-token`` for setup-tokens only.
@@ -1160,9 +1161,18 @@ def add_setup_token(
     ``alias``. When the token was stored is recorded (``setupTokenAddedAt``
     in :func:`accounts_json`).
 
+    ``account`` (sak.9) names the setup-token account (slot, alias or email)
+    that gets the new token in place of its own instead; it keeps its email
+    and alias, and the new token counts from now. ``email`` and ``alias`` do
+    not go with it. An account that runs on a login (or an API key) is
+    refused, as a setup-token cannot show whose it is, and so is the token
+    the account has already.
+
     Raises :class:`ValidationError` for an empty value, an API key, anything
-    that is not a setup-token, a bad email, or a bad or taken alias. Never
-    prompts and never prints the token.
+    that is not a setup-token, a bad email, a bad or taken alias, or an
+    ``account`` that cannot take it; :class:`AccountNotFoundError` for an
+    unknown ``account`` and :class:`CredentialReadError` when its stored
+    login cannot be read now. Never prompts and never prints the token.
     """
     _refuse_foreign_profile()
     value = token.strip()
@@ -1178,6 +1188,14 @@ def add_setup_token(
             "This is not a setup-token: `claude setup-token` prints one that "
             f"starts with {SETUP_TOKEN_PREFIX}."
         )
+    if account is not None:
+        if email is not None or alias is not None:
+            raise ConfigError(
+                "Name the account that gets the new setup-token, or give an email "
+                "and an alias for a new one; not both."
+            )
+        with _quiet():
+            return _replace_setup_token(switcher, account, value)
     with _quiet():
         before = set((switcher._get_sequence_data() or {}).get("accounts", {}))
         label = email.strip() if email else None
@@ -1201,6 +1219,124 @@ def add_setup_token(
         switcher._write_json(switcher.sequence_file, data)
         stored_email = str(record.get("email", label or ""))
     return AddedAccount(slot=slot, email=stored_email, created=created)
+
+
+# -- giving an account a new login in place (sak.9) ------------------------------------
+
+
+def _stored_login(switcher: ClaudeAccountSwitcher, slot: str, email: str) -> str:
+    """The account's stored login (``""`` when it has none); refuses one
+    that cannot be read now rather than taking it for missing."""
+    stored, unreadable = switcher._read_account_credentials_ex(slot, email)
+    if unreadable:
+        raise CredentialReadError(
+            f"Account {slot}'s stored login is unreadable (locked or busy) — "
+            "unlock the keychain and retry."
+        )
+    return stored
+
+
+def _replace_setup_token(
+    switcher: ClaudeAccountSwitcher, account: str, value: str
+) -> AddedAccount:
+    """Store ``value`` as the setup-token account's new token, in its slot."""
+    slot, email, org_uuid = switcher.resolve_account(account)
+    stored = _stored_login(switcher, slot, email)
+    if looks_like_api_key(stored):
+        raise ValidationError(
+            f"Account {slot} ({email}) is an API key, not a setup-token."
+        )
+    if org_uuid or (stored and not is_setup_token(stored)):
+        raise ValidationError(
+            f"Account {slot} ({email}) runs on a login, not a setup-token: a "
+            "setup-token cannot show whose it is, so it never replaces a login."
+        )
+    if stored and (_oauth_entry(stored) or {}).get("accessToken") == value:
+        raise ValidationError(
+            f"Account {slot} ({email}) has this setup-token already; nothing "
+            "changed."
+        )
+    switcher.add_account_from_token(value, email=email, assume_yes=True)
+    data = switcher._get_sequence_data() or {}
+    if switcher._find_account_slot(data, email, "") != slot:  # pragma: no cover
+        raise ConfigError(f"The setup-token was not stored for account {slot}.")
+    data["accounts"][slot]["setupTokenAddedAt"] = get_timestamp()
+    switcher._write_json(switcher.sequence_file, data)
+    return AddedAccount(slot=slot, email=email, created=False)
+
+
+def _default_login_refusal(slot: str, email: str) -> ConfigError:
+    return ConfigError(
+        f"Account {slot} ({email}) is the account Claude Code's default profile "
+        "is logged in to: its stored login follows that live login, so a copy "
+        "cannot replace it. Log in again there, or switch to another account "
+        "first."
+    )
+
+
+def _copy_target(
+    switcher: ClaudeAccountSwitcher, account: str, alias: str | None
+) -> tuple[str, str, str]:
+    """``(slot, email, organization)`` of the account a copy is for, refusing
+    one that cannot take a copy of its login."""
+    if alias is not None:
+        raise ConfigError(
+            "An account that gets a new login keeps its alias; give no alias "
+            "with it."
+        )
+    slot, email, org_uuid = switcher.resolve_account(account)
+    stored = _stored_login(switcher, slot, email)
+    if looks_like_api_key(stored):
+        raise ValidationError(f"Account {slot} ({email}) is an API key, not a login.")
+    if not org_uuid and is_setup_token(stored):
+        raise ValidationError(
+            f"Account {slot} ({email}) runs on a setup-token: it takes a new "
+            "setup-token instead of a login."
+        )
+    if switcher._get_current_account() == (email, org_uuid):
+        raise _default_login_refusal(slot, email)
+    return slot, email, org_uuid
+
+
+def _refuse_own_login(
+    switcher: ClaudeAccountSwitcher,
+    target: tuple[str, str, str],
+    fingerprint: str,
+    where: str,
+) -> None:
+    """The copy must not be the login the account has already."""
+    slot, email, _org = target
+    stored = switcher.read_account_credentials(slot, email)
+    if stored and credential_fingerprint(stored) == fingerprint:
+        raise ConfigError(
+            f"{where} is the login account {slot} ({email}) has already; nothing "
+            "changed."
+        )
+
+
+def _refuse_other_login(
+    switcher: ClaudeAccountSwitcher,
+    target: tuple[str, str, str],
+    identity: tuple[str, str, str | None],
+    where: str,
+    renewed: bool,
+) -> None:
+    """The copy must be the login of the account it is for: the one
+    :meth:`add_account_from_profile` would give it to."""
+    slot, email, org_uuid = target
+    owner, owner_org, owner_org_name = identity
+    data = switcher._get_sequence_data() or {}
+    if switcher._find_account_slot(data, owner, owner_org) == slot:
+        if switcher._get_current_account() == (email, org_uuid):
+            raise _default_login_refusal(slot, email)
+        return
+    whose = owner
+    if owner == email:
+        whose = f"{owner} in another organization ({owner_org_name or owner_org})"
+    ending = "." if renewed else "; nothing changed."
+    raise ValidationError(
+        f"{where} is the login of {whose}, not of account {slot} ({email}){ending}"
+    )
 
 
 # -- copying a login in (sak.8) -----------------------------------------------------
@@ -1276,9 +1412,10 @@ def _renew(credentials: str, where: str) -> str:
     )
 
 
-def _copy_identity(target: str, credentials: str) -> tuple[str, str]:
+def _copy_identity(target: str, credentials: str) -> tuple[str, str, str | None]:
     """Ask Anthropic whose login it is, and record that in the target profile
-    as Claude Code does (``oauthAccount``). Returns ``(email, organization)``."""
+    as Claude Code does (``oauthAccount``). Returns ``(email, organization,
+    the organization's name)``."""
     token = _live_access_token(credentials)
     profile = oauth.fetch_oauth_profile(token) if token else None
     email = profile.get("email") if profile else None
@@ -1300,7 +1437,7 @@ def _copy_identity(target: str, credentials: str) -> tuple[str, str]:
         )
     except OSError as e:
         raise CredentialError(f"Could not record the account in {target}: {e}") from e
-    return email, org_uuid
+    return email, org_uuid, profile.get("organizationName")
 
 
 def add_login_copy(
@@ -1310,6 +1447,7 @@ def add_login_copy(
     credentials: str | None = None,
     source: str | os.PathLike[str] | None = None,
     alias: str | None = None,
+    account: str | None = None,
 ) -> CopiedLogin:
     """Register a copy of a Claude login: the credentials JSON Claude Code
     keeps (``{"claudeAiOauth": ...}``), given as text (``credentials``) or as
@@ -1330,13 +1468,26 @@ def add_login_copy(
     profile is logged in to keeps following its live login.
     ``config_dir`` keeps the copy until :func:`forget_profile_login`.
 
+    ``account`` (sak.9) names the managed account (slot, alias or email) the
+    copy is for: it must be that account's own login, which then replaces
+    its stored login; the account keeps its slot and alias (``alias`` does
+    not go with it). Refused before anything happens: a setup-token or
+    API-key account, the account the default profile is logged in to (its
+    stored login follows the live one) and the login the account has
+    already; refused once Anthropic says whose the copy is: another
+    account's login.
+
     Raises :class:`ConfigError` for neither or both of ``credentials`` and
     ``source``, a missing file, a folder, the default profile, claude-swap's
     own store, or a login that is managed already; :class:`ValidationError`
     for a bare token, an API key, a setup-token, a logged-out or expired
     login, one without its scopes, or a bad alias or one another account
     uses; :class:`CredentialError` when the file cannot be read, the login
-    cannot be renewed, or Anthropic does not say whose it is. Nothing is
+    cannot be renewed, or Anthropic does not say whose it is. With
+    ``account`` also :class:`AccountNotFoundError`, :class:`ConfigError` for
+    the default login's account, the login it has already or an alias, and
+    :class:`ValidationError` for an account of another kind or another
+    account's login. Nothing is
     registered then, and unless the login was renewed nothing changed. A
     renewed copy that cannot be registered raises
     :class:`LoginNotAddedError`: ``config_dir`` holds the only working copy.
@@ -1350,8 +1501,12 @@ def add_login_copy(
                 f"{where} is a bare token, not a login's credentials (the JSON "
                 "with claudeAiOauth); register a setup-token as one."
             )
+        wanted = None if account is None else _copy_target(switcher, account, alias)
         _movable(copy, where, "use")
-        _refuse_managed_grant(switcher, credential_fingerprint(copy) or "", where)
+        fingerprint = credential_fingerprint(copy) or ""
+        if wanted is not None:
+            _refuse_own_login(switcher, wanted, fingerprint, where)
+        _refuse_managed_grant(switcher, fingerprint, where)
         alias = _free_alias(switcher, alias, None)
         target = _empty_profile(switcher, config_dir, path, "copy")
         _keep_copy(target, copy)
@@ -1371,7 +1526,9 @@ def add_login_copy(
     try:
         identity = _copy_identity(target, copy)
         with _quiet():
-            default_login = switcher._get_current_account() == identity
+            if wanted is not None:
+                _refuse_other_login(switcher, wanted, identity, where, renewed)
+            default_login = switcher._get_current_account() == identity[:2]
             slot, created = switcher.add_account_from_profile(target, alias=alias)
             email = switcher.account_email(slot)
     except ClaudeSwitchError as e:
