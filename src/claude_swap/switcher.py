@@ -1949,6 +1949,12 @@ class ClaudeAccountSwitcher:
         """Public wrapper: PIDs of live ``cswap run`` sessions for a slot."""
         return self._live_session_pids(account_num, email)
 
+    def consume_lock_file(self, account_num: str) -> Path:
+        """The slot's consume lock: every POST of its backup refresh token
+        holds it (:meth:`consume_backup_grant`, the active-usage recovery);
+        holding it keeps the stored login from being renewed meanwhile."""
+        return self.credentials_dir / f".consume-{account_num}.lock"
+
     def persist_backup_credentials(
         self, account_num: str, email: str, credentials: str
     ) -> None:
@@ -2075,9 +2081,7 @@ class ClaudeAccountSwitcher:
         # lock is contended ONLY by other gates — waiting on it is exactly
         # the serialization wanted, and the POST is bounded (10 s), so a
         # loser waits briefly or defers.
-        consume_lock = FileLock(
-            self.credentials_dir / f".consume-{account_num}.lock"
-        )
+        consume_lock = FileLock(self.consume_lock_file(account_num))
         if not consume_lock.acquire():
             self._logger.info(
                 "Another consume is in flight for account %s; deferring to "
@@ -4440,7 +4444,7 @@ class ClaudeAccountSwitcher:
             # config save's retries. It is narrowed to the live-store write
             # below (the one step that can touch ~/.claude.json).
             with (
-                FileLock(self.credentials_dir / f".consume-{account_num}.lock"),
+                FileLock(self.consume_lock_file(account_num)),
                 FileLock(self.lock_file),
                 claude_credentials_lock(),
             ):

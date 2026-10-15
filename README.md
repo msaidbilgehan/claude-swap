@@ -386,6 +386,8 @@ api.add_current_login(switcher, alias="work")  # `cswap add`: the default profil
 api.add_profile_login(switcher, "/tmp/login-x", alias="work")  # another profile's login
 api.forget_profile_login("/tmp/login-x")       # then drop the login that profile keeps
 api.remove_account(switcher, "2")              # `cswap remove 2` (and its mappings)
+api.hand_over_login(switcher, "2", "/tmp/login.json")  # the login leaves, then the account
+api.import_login(switcher, "/tmp/login.json", "/tmp/login-y", extra_env={"DISABLE_TELEMETRY": "1"})
 api.set_alias(switcher, "2", "side")           # `cswap alias`; None clears it
 api.map_project(switcher, "~/code/app", "2")   # `cswap map 2 ~/code/app`
 api.unmap_project(switcher, "~/code/app")      # `cswap unmap ~/code/app`
@@ -393,6 +395,10 @@ api.project_mappings(switcher)                 # every mapping with its slot
 ```
 
 `add_profile_login` adds an account without touching the default login: log in with `CLAUDE_CONFIG_DIR=<empty dir> claude auth login`, then pass that exact directory string (Claude names the profile's Keychain item after it). The identity and the credential both come from that profile; the default profile and the active account stay as they are. An account already managed gets the new login and keeps its alias; the account the default profile is logged in to keeps following its live login. `forget_profile_login` removes the login the profile keeps (its Keychain item, its `.credentials.json`) once it is stored or abandoned.
+
+`hand_over_login` is the sending half of a one-way move to another computer: it writes the account's stored login to a new 0600 credentials file, flushed to the disk, then removes the account (as `remove_account` does), so the login is never in two places. The login it hands over is the newest one (a renewal claude-swap set aside, or one Claude Code made in the account's `cswap run` profile, is taken in first), and claude-swap does not renew the login while it leaves. If the removal fails while the account still keeps its login, the file is deleted again and the error is raised; if it fails after the stored login went, the file is kept as the login's only copy and the result's `removal_error` says what failed. It refuses the account the default profile is logged in to (switch away first), an account a live `cswap run` session uses, API-key and setup-token accounts, and a login `import_login` would refuse on the other side (no refresh token, expired, without its scopes). The receiving computer takes the file in with `import_login`.
+
+Two calls start Claude Code themselves: `prepare_session_profile` (`claude auth status --json`, to check a profile) and `import_login` (`claude auth login`, which moves a login in). Both take `extra_env`, variables added to that `claude`'s environment; an embedding program passes its privacy settings this way (`extra_env={"DISABLE_TELEMETRY": "1"}`). claude-swap's own variables win over them and are never taken from `extra_env`: `CLAUDE_CONFIG_DIR` and the login overrides (`ANTHROPIC_API_KEY` and the like) for both calls, and for `import_login` also the refresh-token variables it sets, `CLAUDE_SECURESTORAGE_CONFIG_DIR` and Claude Code's nested-session markers. A name or value an environment cannot hold raises `ValidationError`.
 
 ### Add an account from a raw token or API key
 

@@ -8,7 +8,13 @@ from pathlib import Path
 
 import pytest
 
-from claude_swap.fsutil import read_text_with_retry, replace_with_retry
+from claude_swap import fsutil
+from claude_swap.fsutil import (
+    read_text_with_retry,
+    replace_with_retry,
+    sync_file,
+    sync_folder,
+)
 
 
 class TestReplaceWithRetry:
@@ -284,3 +290,60 @@ class TestStrictRosterReadBranches:
         p = tmp_path / "config.json"
         p.write_text("[1, 2, 3]")
         assert self._switcher(tmp_path)._read_json(p) is None
+
+
+class TestSync:
+    """A handed-over login is its only copy once the account goes (sak.11):
+    it must be on the disk itself, not in a cache, before that."""
+
+    def test_asks_the_drive_to_write_where_it_can(self, tmp_path, monkeypatch):
+        if fsutil.fcntl is None or not hasattr(fsutil.fcntl, "F_FULLFSYNC"):
+            pytest.skip("F_FULLFSYNC is macOS only")
+        asked = []
+        monkeypatch.setattr(fsutil.fcntl, "fcntl", lambda fd, op: asked.append(op) or 0)
+        monkeypatch.setattr(fsutil.os, "fsync", lambda fd: asked.append("fsync"))
+        with (tmp_path / "f").open("w") as f:
+            sync_file(f.fileno())
+        assert asked == [fsutil.fcntl.F_FULLFSYNC]
+
+    def test_falls_back_to_fsync(self, tmp_path, monkeypatch):
+        synced = []
+        if fsutil.fcntl is not None and hasattr(fsutil.fcntl, "F_FULLFSYNC"):
+
+            def refuse(fd, op):
+                raise OSError(25, "Inappropriate ioctl for device")
+
+            monkeypatch.setattr(fsutil.fcntl, "fcntl", refuse)
+        monkeypatch.setattr(fsutil.os, "fsync", lambda fd: synced.append(fd))
+        with (tmp_path / "f").open("w") as f:
+            sync_file(f.fileno())
+            assert synced == [f.fileno()]
+
+    def test_a_failed_flush_is_raised(self, tmp_path, monkeypatch):
+        if fsutil.fcntl is not None and hasattr(fsutil.fcntl, "F_FULLFSYNC"):
+
+            def refuse(fd, op):
+                raise OSError(25, "Inappropriate ioctl for device")
+
+            monkeypatch.setattr(fsutil.fcntl, "fcntl", refuse)
+
+        def broken(fd):
+            raise OSError(5, "Input/output error")
+
+        monkeypatch.setattr(fsutil.os, "fsync", broken)
+        with (tmp_path / "f").open("w") as f, pytest.raises(OSError):
+            sync_file(f.fileno())
+
+    @pytest.mark.skipif(sys.platform == "win32", reason="POSIX folders only")
+    def test_a_folder_is_synced_and_never_raises(self, tmp_path, monkeypatch):
+        synced = []
+        monkeypatch.setattr(fsutil, "sync_file", lambda fd: synced.append(fd))
+        sync_folder(tmp_path)
+        assert len(synced) == 1
+
+        def broken(fd):
+            raise OSError(22, "Invalid argument")
+
+        monkeypatch.setattr(fsutil, "sync_file", broken)
+        sync_folder(tmp_path)  # best effort
+        sync_folder(tmp_path / "missing")

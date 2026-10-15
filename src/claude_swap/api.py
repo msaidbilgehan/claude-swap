@@ -35,7 +35,7 @@ import shutil
 import subprocess
 import threading
 import time
-from collections.abc import Callable, Collection, Iterator
+from collections.abc import Callable, Collection, Iterator, Mapping
 from dataclasses import dataclass
 from importlib.metadata import version as _dist_version
 from pathlib import Path
@@ -69,7 +69,9 @@ from claude_swap.exceptions import (
     SwitchError,
     ValidationError,
 )
+from claude_swap.fsutil import sync_file, sync_folder
 from claude_swap.json_output import SCHEMA_VERSION
+from claude_swap.locking import FileLock
 from claude_swap.models import Platform, get_timestamp, normalize_alias
 from claude_swap.oauth import (
     credential_fingerprint,
@@ -80,6 +82,7 @@ from claude_swap.paths import get_claude_config_home, get_default_claude_config_
 from claude_swap.session import (
     AUTH_OVERRIDE_ENV_VARS,
     SessionManager,
+    child_env,
     forget_config_dir_login,
     read_config_dir_credentials,
 )
@@ -102,6 +105,7 @@ __all__ = [
     "CopiedLogin",
     "CredentialError",
     "ErrorEvent",
+    "HandedOver",
     "LockError",
     "LoginNotAddedError",
     "LoginSource",
@@ -128,6 +132,7 @@ __all__ = [
     "check_login_source",
     "create_engine",
     "forget_profile_login",
+    "hand_over_login",
     "import_login",
     "inject_system_trust",
     "live_session_accounts",
@@ -261,6 +266,27 @@ class CopiedLogin(NamedTuple):
     renewed: bool
     """The copy's access token had lapsed and was renewed first: the copy it
     came from no longer works."""
+
+
+class HandedOver(NamedTuple):
+    """What :func:`hand_over_login` did (sak.11): the account whose login left
+    claude-swap for a credentials file. Carries no token material."""
+
+    slot: str
+    """The slot the account had; it is free now."""
+    email: str
+    organization_uuid: str | None
+    organization: str | None
+    """The organization's name, when claude-swap recorded one."""
+    alias: str | None
+    expires_at: str | None
+    """When the login itself lapses (ISO 8601 UTC), when Claude Code recorded
+    it."""
+    removal_error: str | None = None
+    """``None`` when the account went with its login. Otherwise the login
+    left (the file is its only copy here: deliver it all the same), but
+    removing the rest of the account failed with this error: claude-swap
+    may still list the account, without a login, until it is removed."""
 
 
 class LoginNotAddedError(CredentialError):
@@ -595,8 +621,27 @@ def inject_system_trust() -> bool:
     return True
 
 
+def _checked_env(extra_env: Mapping[str, str] | None) -> dict[str, str]:
+    """``extra_env`` (sak.11) as a child's environment can hold it; refuses
+    names and values it cannot (the values are never repeated)."""
+    checked: dict[str, str] = {}
+    for name, value in (extra_env or {}).items():
+        if not isinstance(name, str) or not name or "=" in name or "\0" in name:
+            raise ValidationError(f"extra_env: {name!r} is not a variable name.")
+        if not isinstance(value, str) or "\0" in value:
+            raise ValidationError(
+                f"extra_env: the value of {name} is not text a variable can hold."
+            )
+        checked[name] = value
+    return checked
+
+
 def prepare_session_profile(
-    switcher: ClaudeAccountSwitcher, identifier: str, *, share_history: bool = True
+    switcher: ClaudeAccountSwitcher,
+    identifier: str,
+    *,
+    share_history: bool = True,
+    extra_env: Mapping[str, str] | None = None,
 ) -> SessionProfile:
     """Create or refresh the session-mode profile of ``identifier``.
 
@@ -607,10 +652,18 @@ def prepare_session_profile(
     ``share_history`` shares conversation history with the default profile
     (POSIX only). Settings and MCP servers are always shared, as with
     ``cswap run``. May run ``claude auth status`` and refresh a token.
+
+    ``extra_env`` (sak.11): variables added to the environment of that
+    ``claude auth status`` (an embedding program's privacy settings, for
+    example). claude-swap's own variables win over them: the profile's
+    ``CLAUDE_CONFIG_DIR``, and the login overrides it strips
+    (``strip_env``), which are never passed on. A name or value an
+    environment cannot hold raises :class:`ValidationError`.
     """
     _refuse_foreign_profile()
     if share_history and switcher.platform == Platform.WINDOWS:
         raise SessionError("share_history is not supported on Windows")
+    extra = _checked_env(extra_env)
     with _quiet():
         account_num, email, org_uuid = switcher.resolve_account(identifier)
         current = switcher._get_current_account()
@@ -620,9 +673,9 @@ def prepare_session_profile(
                 "a session profile would hold a second copy of its live "
                 "credential. Switch the default login to another account first."
             )
-        session_dir, slot, slot_email = SessionManager(switcher).setup_session(
-            identifier, True, share_history
-        )
+        session_dir, slot, slot_email = SessionManager(
+            switcher, extra_env=extra
+        ).setup_session(identifier, True, share_history)
     return SessionProfile(
         config_dir=str(session_dir),
         slot=str(slot),
@@ -1002,14 +1055,20 @@ def _summary(output: str, secret: str) -> str:
     return text.replace(secret, "<token>")[:300]
 
 
-def _exchange(found: _Found, target: str, claude: str | os.PathLike[str] | None) -> None:
+def _exchange(
+    found: _Found,
+    target: str,
+    claude: str | os.PathLike[str] | None,
+    extra_env: Mapping[str, str],
+) -> None:
     """Let Claude Code turn the refresh token into a new login in ``target``
     (``claude auth login`` with ``CLAUDE_CODE_OAUTH_REFRESH_TOKEN``: no
-    browser). Once it has, the source's copy no longer works."""
+    browser). Once it has, the source's copy no longer works. ``extra_env``
+    is added to its environment; the variables set or removed here win."""
     executable = os.fspath(claude) if claude is not None else shutil.which("claude")
     if not executable:
         raise SessionError("'claude' was not found on PATH. Install Claude Code first.")
-    env = {k: v for k, v in os.environ.items() if k not in _MOVE_ENV_REMOVED}
+    env = child_env(_MOVE_ENV_REMOVED, extra_env)
     env["CLAUDE_CONFIG_DIR"] = target
     env["CLAUDE_CODE_OAUTH_REFRESH_TOKEN"] = found.refresh_token
     env["CLAUDE_CODE_OAUTH_SCOPES"] = " ".join(found.scopes)
@@ -1064,6 +1123,7 @@ def import_login(
     *,
     alias: str | None = None,
     claude: str | os.PathLike[str] | None = None,
+    extra_env: Mapping[str, str] | None = None,
 ) -> MovedLogin:
     """Move a Claude login in from ``source`` (see :func:`check_login_source`)
     without copying it: the one-way move.
@@ -1082,22 +1142,32 @@ def import_login(
 
     ``config_dir`` keeps the new login until :func:`forget_profile_login`.
     ``claude`` is the Claude Code executable (default: ``claude`` on PATH).
+    ``extra_env`` (sak.11): variables added to the environment of that
+    ``claude auth login`` (an embedding program's privacy settings, for
+    example). claude-swap's own variables win over them:
+    ``CLAUDE_CONFIG_DIR``, ``CLAUDE_CODE_OAUTH_REFRESH_TOKEN`` and
+    ``CLAUDE_CODE_OAUTH_SCOPES`` are set by the move, and the variables it
+    keeps from Claude Code (the login overrides,
+    ``CLAUDE_SECURESTORAGE_CONFIG_DIR``, the nested-session markers) are
+    dropped from ``extra_env`` too.
 
     Raises what :func:`check_login_source` raises, before anything moves, and
-    :class:`ValidationError` for a bad alias or one another account uses;
+    :class:`ValidationError` for a bad alias or one another account uses, or
+    an ``extra_env`` name or value an environment cannot hold;
     :class:`SessionError` when Claude Code cannot run; :class:`CredentialError`
     when it could not move the login (nothing moved then). After the move,
     a failed registration raises :class:`LoginNotAddedError`: ``config_dir``
     holds the only working copy. The token is never printed or logged.
     """
     _refuse_foreign_profile()
+    extra = _checked_env(extra_env)
     with _quiet():
         found = _find_login(switcher, source)
         alias = _free_alias(switcher, alias, found.info.slot)
         target = _empty_profile(switcher, config_dir, found.info.path)
     # Outside the output lock: Claude Code may take a while, and every other
     # call of this module waits for that lock.
-    _exchange(found, target, claude)
+    _exchange(found, target, claude, extra)
     with _quiet():
         try:
             identity = _profile_identity(Path(target))
@@ -1593,3 +1663,233 @@ def add_login_copy(
         default_login=default_login,
         renewed=renewed,
     )
+
+
+# -- handing a login over (sak.11) --------------------------------------------------
+
+
+def _handed_over_file(
+    switcher: ClaudeAccountSwitcher, destination: str | os.PathLike[str]
+) -> Path:
+    """The file a handed-over login goes to: new, outside the default
+    profile and claude-swap's own store (a login there would be taken for a
+    managed or live one)."""
+    raw = os.path.expanduser(os.fspath(destination)).strip()
+    if not raw:
+        raise ConfigError("Name the file the login goes to.")
+    path = Path(raw)
+    for root, what in (
+        (get_default_claude_config_home(), "Claude Code's default profile"),
+        (Path(switcher.backup_dir), "claude-swap's own store"),
+    ):
+        if _inside(path, root) or _inside(path.parent, root):
+            raise ConfigError(f"{raw} is inside {what}; name a file elsewhere.")
+    if not path.parent.is_dir():
+        raise ConfigError(f"{path.parent} is not a folder.")
+    return path
+
+
+HAND_OVER_LOCK_TIMEOUT = 30.0
+"""How long :func:`hand_over_login` waits for a renewal of the account's
+login to end (a renewal's request is bounded at 10 s)."""
+
+
+def _write_new_file(path: Path, credentials: str) -> None:
+    """Write the login as Claude Code keeps it outside the macOS Keychain:
+    a new file, readable by its owner only (an existing file is never
+    replaced), and on the disk itself before this returns, since it becomes
+    the login's only copy once the account goes."""
+    try:
+        fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+    except FileExistsError as e:
+        raise ConfigError(f"{path} exists already; name a new file.") from e
+    except OSError as e:
+        raise CredentialError(f"Could not write the login to {path}: {e}") from e
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as f:
+            f.write(credentials)
+            f.flush()
+            sync_file(f.fileno())
+    except OSError as e:
+        with contextlib.suppress(OSError):
+            path.unlink()
+        raise CredentialError(f"Could not write the login to {path}: {e}") from e
+    sync_folder(path.parent)
+
+
+def _handover_refusal(
+    switcher: ClaudeAccountSwitcher, slot: str, email: str, org_uuid: str, stored: str
+) -> ClaudeSwitchError | None:
+    """Why the account's login cannot leave claude-swap, or ``None``."""
+    if not stored:
+        return CredentialError(
+            f"Account {slot} ({email}) has no stored login to hand over."
+        )
+    if looks_like_api_key(stored):
+        return ValidationError(
+            f"Account {slot} ({email}) is an API key, not a login; add the key "
+            "where it is needed instead."
+        )
+    if not org_uuid and is_setup_token(stored):
+        return ValidationError(
+            f"Account {slot} ({email}) runs on a setup-token, not a login; add "
+            "the setup-token where it is needed instead."
+        )
+    if switcher._get_current_account() == (email, org_uuid):
+        return ConfigError(
+            f"Account {slot} ({email}) is the account Claude Code's default "
+            "profile is logged in to; switch to another account first."
+        )
+    if switcher.live_session_pids_for(slot, email):
+        return SessionError(
+            f"A Claude session runs on account {slot} ({email}); end it first."
+        )
+    try:
+        # what import_login takes on the other computer, checked before the
+        # account goes: a login it refuses would be stuck in transit
+        _movable(stored, f"Account {slot} ({email})'s stored login")
+    except ValidationError as e:
+        return e
+    return None
+
+
+@contextlib.contextmanager
+def _renewals_held(switcher: ClaudeAccountSwitcher, slot: str) -> Iterator[None]:
+    """Keep the account's stored login from being renewed meanwhile: every
+    renewal holds the slot's consume lock, and a renewal would spend the copy
+    being handed over."""
+    lock = FileLock(switcher.consume_lock_file(slot), timeout=HAND_OVER_LOCK_TIMEOUT)
+    if not lock.acquire():
+        raise LockError(
+            f"Account {slot}'s login is being renewed right now; try again in a moment."
+        )
+    try:
+        yield
+    finally:
+        lock.release()
+
+
+def _newest_login(
+    switcher: ClaudeAccountSwitcher, slot: str, email: str, org_uuid: str
+) -> str:
+    """The account's stored login, after taking in a newer one where there
+    is one: a renewal whose saving failed (claude-swap set it aside) and one
+    Claude Code made in the account's ``cswap run`` profile (as a switch
+    takes it in). The caller holds :func:`_renewals_held`."""
+    with FileLock(switcher.lock_file):
+        current, unreadable = switcher._read_account_credentials_ex(slot, email)
+        if current and not unreadable:
+            switcher._adopt_stashed_successor(slot, email, current)
+    switcher._adopt_session_credential(slot, email, org_uuid)
+    if switcher._session_profile_ahead(slot, email, org_uuid):
+        raise SessionError(
+            f"Account {slot} ({email}) was renewed in its `cswap run` profile, and "
+            "that newer login cannot be taken in now (a Claude session may run "
+            "there); end it and try again."
+        )
+    return _stored_login(switcher, slot, email)
+
+
+def _still_stored(
+    switcher: ClaudeAccountSwitcher, slot: str, email: str, stored: str
+) -> bool:
+    """Whether the account still keeps the login that was handed over (a
+    removal that failed took nothing); False when that cannot be read now."""
+    try:
+        current, unreadable = switcher._read_account_credentials_ex(slot, email)
+    except (ClaudeSwitchError, OSError):
+        return False
+    if unreadable or not current:
+        return False
+    fingerprint = credential_fingerprint(stored)
+    if fingerprint is None:
+        return current.strip() == stored.strip()
+    return credential_fingerprint(current) == fingerprint
+
+
+def hand_over_login(
+    switcher: ClaudeAccountSwitcher,
+    identifier: str,
+    destination: str | os.PathLike[str],
+) -> HandedOver:
+    """Hand an account's login over to another computer: the other half of
+    the one-way move (:func:`import_login` takes it in there).
+
+    Writes the account's stored login to ``destination``, a new Claude Code
+    credentials file (``{"claudeAiOauth": ...}``, mode 0600, never an
+    existing file, flushed to the disk), then removes the account from
+    claude-swap (its stored login, config and mappings) as
+    :func:`remove_account` does. From then on the file is the account's only
+    copy here: deliver it, then delete it. The login handed over is the
+    newest one: a renewal claude-swap set aside, or one Claude Code made in
+    the account's ``cswap run`` profile, is taken in first, and claude-swap
+    does not renew the login while it leaves (a renewal under way is waited
+    for, up to :data:`HAND_OVER_LOCK_TIMEOUT` seconds).
+
+    If the removal fails while the account still keeps its login, the file
+    is deleted and the error is raised: nothing changed. If it fails after
+    the stored login went (or when that cannot be read), the file is kept,
+    as the login's only copy, and the result says what failed
+    (``removal_error``); claude-swap may still list the account then,
+    without a login.
+
+    ``identifier`` is a slot, alias or email. Refused before anything is
+    written: the account the default profile is logged in to (switch to
+    another account first), an account a live ``cswap run`` session uses,
+    an API-key or setup-token account, an account without a stored login,
+    a login :func:`import_login` would refuse (no refresh token, expired,
+    without its scopes), and a destination that exists, whose folder is
+    missing, or that lies in the default profile or claude-swap's own store.
+
+    Raises :class:`AccountNotFoundError` for an unknown account,
+    :class:`ConfigError` for the default login's account, an ambiguous email
+    or a refused destination, :class:`SessionError` for a live session (or a
+    newer login in its profile that cannot be taken in now),
+    :class:`ValidationError` for an API key, a setup-token or a login that
+    cannot move, :class:`LockError` while a renewal of the account does not
+    end, and :class:`CredentialError` when the stored login is missing or
+    unreadable or the file cannot be written. Never prompts; the token is
+    never printed or logged.
+    """
+    _refuse_foreign_profile()
+    with _quiet():
+        slot, email, org_uuid = switcher.resolve_account(identifier)
+        stored = _stored_login(switcher, slot, email)
+        refusal = _handover_refusal(switcher, slot, email, org_uuid, stored)
+        if refusal is not None:
+            raise refusal
+        path = _handed_over_file(switcher, destination)
+    # The renewals are waited for outside the output lock (every other call
+    # of this module waits for that lock), which is taken once they are held.
+    with _renewals_held(switcher, slot), _quiet():
+        stored = _newest_login(switcher, slot, email, org_uuid)
+        refusal = _handover_refusal(switcher, slot, email, org_uuid, stored)
+        if refusal is not None:
+            raise refusal
+        record = (switcher._get_sequence_data() or {}).get("accounts", {}).get(slot, {})
+        handed = HandedOver(
+            slot=slot,
+            email=email,
+            organization_uuid=org_uuid or None,
+            organization=str(record.get("organizationName") or "") or None,
+            alias=str(record.get("alias") or "") or None,
+            expires_at=login_expires_at_iso(stored),
+        )
+        _write_new_file(path, stored)
+        try:
+            switcher.remove_account(slot, assume_yes=True)
+        except BaseException as e:
+            if _still_stored(switcher, slot, email, stored):
+                with contextlib.suppress(OSError):
+                    path.unlink()
+                raise
+            if not isinstance(e, Exception):
+                raise  # the file stays: it is the login's only copy
+            _logger.warning(
+                "api: account %s's login was handed over, but the rest of the "
+                "account could not be removed: %s",
+                slot,
+                e,
+            )
+            return handed._replace(removal_error=str(e) or type(e).__name__)
+    return handed

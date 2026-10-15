@@ -40,6 +40,7 @@ EXPECTED_ALL = [
     "CopiedLogin",
     "CredentialError",
     "ErrorEvent",
+    "HandedOver",
     "LockError",
     "LoginNotAddedError",
     "LoginSource",
@@ -66,6 +67,7 @@ EXPECTED_ALL = [
     "check_login_source",
     "create_engine",
     "forget_profile_login",
+    "hand_over_login",
     "import_login",
     "inject_system_trust",
     "live_session_accounts",
@@ -112,7 +114,8 @@ EXPECTED_SIGNATURES = {
     ),
     "prepare_session_profile": (
         "(switcher: 'ClaudeAccountSwitcher', identifier: 'str', *, "
-        "share_history: 'bool' = True) -> 'SessionProfile'"
+        "share_history: 'bool' = True, "
+        "extra_env: 'Mapping[str, str] | None' = None) -> 'SessionProfile'"
     ),
     "running_autoswitchers": (
         "(switcher: 'ClaudeAccountSwitcher') -> 'list[AutoSwitcherInstance]'"
@@ -137,7 +140,8 @@ EXPECTED_SIGNATURES = {
     "import_login": (
         "(switcher: 'ClaudeAccountSwitcher', source: 'str | os.PathLike[str]', "
         "config_dir: 'str | os.PathLike[str]', *, alias: 'str | None' = None, "
-        "claude: 'str | os.PathLike[str] | None' = None) -> 'MovedLogin'"
+        "claude: 'str | os.PathLike[str] | None' = None, "
+        "extra_env: 'Mapping[str, str] | None' = None) -> 'MovedLogin'"
     ),
     "add_login_copy": (
         "(switcher: 'ClaudeAccountSwitcher', config_dir: 'str | os.PathLike[str]', *, "
@@ -149,6 +153,10 @@ EXPECTED_SIGNATURES = {
         "(switcher: 'ClaudeAccountSwitcher', token: 'str', *, "
         "email: 'str | None' = None, alias: 'str | None' = None, "
         "account: 'str | None' = None) -> 'AddedAccount'"
+    ),
+    "hand_over_login": (
+        "(switcher: 'ClaudeAccountSwitcher', identifier: 'str', "
+        "destination: 'str | os.PathLike[str]') -> 'HandedOver'"
     ),
     "remove_account": (
         "(switcher: 'ClaudeAccountSwitcher', identifier: 'str') -> 'tuple[str, str]'"
@@ -578,6 +586,58 @@ class TestPrepareSessionProfile:
         api.prepare_session_profile(seeded.switcher, "2")
         assert calls == [True]
 
+    def test_extra_env_reaches_claude_auth_status(self, seeded, monkeypatch):
+        import subprocess
+
+        from claude_swap import session as session_mod
+
+        profile = session_mod.session_dir_for(
+            seeded.switcher.backup_dir, "2", "b@example.com"
+        )
+        profile.mkdir(parents=True)
+        probes = []
+
+        def auth_status(cmd, env=None, **_kwargs):
+            probes.append((cmd[1:], env))
+            status = {
+                "loggedIn": True,
+                "authMethod": "claude.ai",
+                "email": "b@example.com",
+            }
+            return subprocess.CompletedProcess(
+                cmd, 0, stdout=json.dumps(status), stderr=""
+            )
+
+        monkeypatch.setattr(session_mod.subprocess, "run", auth_status)
+        monkeypatch.setenv("ANTHROPIC_API_KEY", "sk-ant-api03-ignored")
+        result = api.prepare_session_profile(
+            seeded.switcher,
+            "2",
+            share_history=False,
+            extra_env={
+                "DISABLE_TELEMETRY": "1",
+                "CLAUDE_CONFIG_DIR": "/somewhere/else",
+                "CLAUDE_CODE_OAUTH_TOKEN": "sk-ant-oat01-not-here",
+            },
+        )
+        assert result.config_dir == str(profile)
+        ((argv, env),) = probes
+        assert argv == ["auth", "status", "--json"]
+        assert env["DISABLE_TELEMETRY"] == "1"
+        assert env["CLAUDE_CONFIG_DIR"] == str(profile)
+        assert "CLAUDE_CODE_OAUTH_TOKEN" not in env
+        assert "ANTHROPIC_API_KEY" not in env
+
+    def test_extra_env_no_environment_holds_is_refused(self, seeded, monkeypatch):
+        from claude_swap.session import SessionManager
+
+        def must_not_run(*_a, **_k):
+            raise AssertionError("nothing may run for a refused extra_env")
+
+        monkeypatch.setattr(SessionManager, "setup_session", must_not_run)
+        with pytest.raises(api.ValidationError, match="extra_env"):
+            api.prepare_session_profile(seeded.switcher, "2", extra_env={"A=B": "1"})
+
     def test_unknown_account(self, seeded):
         with pytest.raises(api.AccountNotFoundError):
             api.prepare_session_profile(seeded.switcher, "7")
@@ -949,7 +1009,11 @@ plan = json.loads((here / "plan.json").read_text())
 seen = {
     "argv": sys.argv[1:],
     "cwd": os.getcwd(),
-    "env": {k: v for k, v in os.environ.items() if k.startswith(("CLAUDE", "ANTHROPIC"))},
+    "env": {
+        k: v
+        for k, v in os.environ.items()
+        if k.startswith(("CLAUDE", "ANTHROPIC", "DISABLE_"))
+    },
 }
 (here / "seen.json").write_text(json.dumps(seen))
 mode = plan["mode"]
@@ -1236,6 +1300,50 @@ class TestImportLogin:
             slot="1", email="a@example.com", created=False
         )
         assert seeded.switcher.read_account_credentials("1", "a@example.com") == before
+
+    def test_extra_env_reaches_claude_under_its_own_variables(
+        self, seeded, tmp_path, claude, target
+    ):
+        source = _login_file(tmp_path / "copy.json")
+        api.import_login(
+            seeded.switcher,
+            source,
+            target,
+            claude=claude.path,
+            extra_env={
+                "DISABLE_TELEMETRY": "1",
+                "CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC": "1",
+                "CLAUDE_CONFIG_DIR": "/somewhere/else",
+                "CLAUDE_CODE_OAUTH_REFRESH_TOKEN": "sk-ant-ort01-other",
+                "CLAUDE_CODE_OAUTH_SCOPES": "user:inference",
+                "CLAUDE_SECURESTORAGE_CONFIG_DIR": "/somewhere/else",
+                "ANTHROPIC_API_KEY": "sk-ant-api03-not-here",
+                "CLAUDECODE": "1",
+            },
+        )
+        env = claude.seen["env"]
+        assert env["DISABLE_TELEMETRY"] == "1"
+        assert env["CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC"] == "1"
+        assert env["CLAUDE_CONFIG_DIR"] == str(target)
+        assert env["CLAUDE_CODE_OAUTH_REFRESH_TOKEN"] == "sk-ant-ort01-source"
+        assert env["CLAUDE_CODE_OAUTH_SCOPES"] == " ".join(_SCOPES)
+        for name in ("CLAUDE_SECURESTORAGE_CONFIG_DIR", "ANTHROPIC_API_KEY", "CLAUDECODE"):
+            assert name not in env
+
+    @pytest.mark.parametrize(
+        "extra_env",
+        [{"A=B": "1"}, {"": "1"}, {"DISABLE_TELEMETRY": "1\x00"}, {"X": 1}],
+    )
+    def test_extra_env_no_environment_holds_is_refused(
+        self, seeded, tmp_path, claude, target, extra_env
+    ):
+        source = _login_file(tmp_path / "copy.json")
+        with pytest.raises(api.ValidationError, match="extra_env"):
+            api.import_login(
+                seeded.switcher, source, target, claude=claude.path, extra_env=extra_env
+            )
+        assert claude.seen is None
+        assert source.exists()
 
     def test_a_failed_move_changes_nothing(
         self, seeded, tmp_path, claude, target, caplog
@@ -2076,3 +2184,295 @@ class TestUpdateLoginCopy:
             )
         assert anthropic.asked == []
         assert not (target / ".credentials.json").exists()
+
+
+def _login(refresh: str = "rt-2", **extra) -> dict:
+    """A stored login as Claude Code keeps it, with what a move needs."""
+    entry = {
+        "accessToken": "sk-2",
+        "refreshToken": refresh,
+        "expiresAt": 1_900_000_000_000,
+        "scopes": _SCOPES,
+        **extra,
+    }
+    return {"claudeAiOauth": {k: v for k, v in entry.items() if v is not None}}
+
+
+def _store_login(seeded, num: int = 2, email: str = "b@example.com", **login) -> dict:
+    stored = _login(**login)
+    seeded.switcher._write_account_credentials(str(num), email, json.dumps(stored))
+    return stored
+
+
+class TestHandOverLogin:
+    """The other half of the one-way move (sak.11): an account's login leaves
+    claude-swap for a credentials file, and the account goes."""
+
+    @pytest.fixture
+    def stored(self, seeded) -> dict:
+        return _store_login(seeded)
+
+    def test_writes_the_login_and_removes_the_account(
+        self, seeded, stored, tmp_path, capfd
+    ):
+        api.map_project(seeded.switcher, tmp_path, "2")
+        api.set_alias(seeded.switcher, "2", "work")
+        destination = tmp_path / "login.json"
+        capfd.readouterr()
+        handed = api.hand_over_login(seeded.switcher, "work", destination)
+        _assert_silent(capfd)
+        assert handed == api.HandedOver(
+            slot="2",
+            email="b@example.com",
+            organization_uuid=None,
+            organization=None,
+            alias="work",
+            expires_at=None,
+        )
+        assert handed.removal_error is None
+        assert json.loads(destination.read_text()) == stored
+        assert destination.stat().st_mode & 0o777 == 0o600
+        assert _numbers(seeded) == [1]
+        assert api.project_mappings(seeded.switcher) == []
+
+    def test_carries_the_logins_expiry_and_organization(self, seeded, tmp_path):
+        _store_login(seeded, refreshTokenExpiresAt=1_900_000_000_000)
+        _give_org(seeded, 2, "org-2")
+        data = seeded.switcher._get_sequence_data()
+        data["accounts"]["2"]["organizationName"] = "Team"
+        seeded.switcher._write_json(seeded.switcher.sequence_file, data)
+        handed = api.hand_over_login(seeded.switcher, "2", tmp_path / "login.json")
+        assert handed.organization_uuid == "org-2"
+        assert handed.organization == "Team"
+        assert handed.expires_at == "2030-03-17T17:46:40Z"
+
+    def test_the_file_is_on_the_disk_before_the_account_goes(
+        self, seeded, stored, tmp_path, monkeypatch
+    ):
+        destination = tmp_path / "login.json"
+        steps: list[str] = []
+        monkeypatch.setattr(api, "sync_file", lambda fd: steps.append("file"))
+        monkeypatch.setattr(api, "sync_folder", lambda folder: steps.append("folder"))
+        remove = seeded.switcher.remove_account
+
+        def removing(*a, **k):
+            steps.append("remove")
+            assert json.loads(destination.read_text()) == stored
+            return remove(*a, **k)
+
+        monkeypatch.setattr(seeded.switcher, "remove_account", removing)
+        api.hand_over_login(seeded.switcher, "2", destination)
+        assert steps == ["file", "folder", "remove"]
+
+    def test_refuses_the_default_logins_account(self, seeded, tmp_path):
+        destination = tmp_path / "login.json"
+        with pytest.raises(api.ConfigError, match="switch to another account first"):
+            api.hand_over_login(seeded.switcher, "1", destination)
+        assert not destination.exists()
+        assert _numbers(seeded) == [1, 2]
+
+    def test_refuses_an_account_a_live_session_uses(self, seeded, stored, tmp_path):
+        from claude_swap.session import session_dir_for
+
+        profile = session_dir_for(seeded.switcher.backup_dir, "2", "b@example.com")
+        (profile / "sessions").mkdir(parents=True)
+        (profile / "sessions" / f"{os.getpid()}.json").write_text(
+            json.dumps({"pid": os.getpid(), "sessionId": "s", "cwd": "/"})
+        )
+        destination = tmp_path / "login.json"
+        with pytest.raises(api.SessionError, match="end it first"):
+            api.hand_over_login(seeded.switcher, "2", destination)
+        assert not destination.exists()
+        assert _numbers(seeded) == [1, 2]
+
+    @pytest.mark.parametrize(
+        ("stored", "match"),
+        [
+            ("sk-ant-api03-key", "API key"),
+            (
+                json.dumps({
+                    "claudeAiOauth": {
+                        "accessToken": "sk-ant-oat01-x",
+                        "scopes": ["user:inference"],
+                    }
+                }),
+                "setup-token",
+            ),
+        ],
+    )
+    def test_refuses_what_is_not_a_login(self, seeded, tmp_path, stored, match):
+        seeded.switcher._write_account_credentials("2", "b@example.com", stored)
+        destination = tmp_path / "login.json"
+        with pytest.raises(api.ValidationError, match=match):
+            api.hand_over_login(seeded.switcher, "2", destination)
+        assert not destination.exists()
+        assert _numbers(seeded) == [1, 2]
+
+    @pytest.mark.parametrize(
+        ("login", "match"),
+        [
+            ({"scopes": None}, "scopes"),
+            ({"refresh": ""}, "no refresh token"),
+            ({"refreshTokenExpiresAt": 1_000_000_000_000}, "expired"),
+        ],
+    )
+    def test_refuses_a_login_the_other_computer_could_not_take(
+        self, seeded, tmp_path, login, match
+    ):
+        before = _store_login(seeded, **login)
+        destination = tmp_path / "login.json"
+        with pytest.raises(api.ValidationError, match=match):
+            api.hand_over_login(seeded.switcher, "2", destination)
+        assert not destination.exists()
+        assert _numbers(seeded) == [1, 2]
+        stored = seeded.switcher.read_account_credentials("2", "b@example.com")
+        assert json.loads(stored) == before
+
+    def test_refuses_an_existing_file_and_a_place_it_must_not_go(
+        self, seeded, stored, temp_home, tmp_path
+    ):
+        existing = tmp_path / "login.json"
+        existing.write_text("keep")
+        with pytest.raises(api.ConfigError, match="exists already"):
+            api.hand_over_login(seeded.switcher, "2", existing)
+        assert existing.read_text() == "keep"
+        for place, match in (
+            (temp_home / ".claude" / "login.json", "default profile"),
+            (Path(seeded.switcher.backup_dir) / "login.json", "own store"),
+            (tmp_path / "missing" / "login.json", "not a folder"),
+            ("", "Name the file"),
+        ):
+            with pytest.raises(api.ConfigError, match=match):
+                api.hand_over_login(seeded.switcher, "2", place)
+        assert _numbers(seeded) == [1, 2]
+
+    def test_a_failed_removal_takes_the_file_back(
+        self, seeded, stored, tmp_path, monkeypatch
+    ):
+        def fail(*_a, **_k):
+            raise api.LockError("busy")
+
+        monkeypatch.setattr(seeded.switcher, "remove_account", fail)
+        destination = tmp_path / "login.json"
+        with pytest.raises(api.LockError, match="busy"):
+            api.hand_over_login(seeded.switcher, "2", destination)
+        assert not destination.exists()
+        assert _numbers(seeded) == [1, 2]
+
+    def test_a_removal_that_fails_after_the_login_went_keeps_the_file(
+        self, seeded, stored, tmp_path, monkeypatch, capfd
+    ):
+        sequence = seeded.switcher.sequence_file
+        write = seeded.switcher._write_json
+
+        def full_disk(target, data):
+            if target == sequence:
+                raise OSError(28, "No space left on device")
+            return write(target, data)
+
+        monkeypatch.setattr(seeded.switcher, "_write_json", full_disk)
+        destination = tmp_path / "login.json"
+        capfd.readouterr()
+        handed = api.hand_over_login(seeded.switcher, "2", destination)
+        _assert_silent(capfd)
+        assert "No space left on device" in (handed.removal_error or "")
+        assert json.loads(destination.read_text()) == stored
+        assert seeded.switcher.read_account_credentials("2", "b@example.com") == ""
+        monkeypatch.setattr(seeded.switcher, "_write_json", write)
+        assert _numbers(seeded) == [1, 2]  # listed still, without its login
+
+    def test_a_removal_whose_outcome_cannot_be_read_keeps_the_file(
+        self, seeded, stored, tmp_path, monkeypatch
+    ):
+        removing = {"started": False}
+
+        def fail(*_a, **_k):
+            removing["started"] = True
+            raise api.CredentialError("the keychain went away")
+
+        monkeypatch.setattr(seeded.switcher, "remove_account", fail)
+        read = seeded.switcher._read_account_credentials_ex
+
+        def unreadable_after_the_removal(slot, email):
+            return ("", True) if removing["started"] else read(slot, email)
+
+        monkeypatch.setattr(
+            seeded.switcher, "_read_account_credentials_ex", unreadable_after_the_removal
+        )
+        destination = tmp_path / "login.json"
+        handed = api.hand_over_login(seeded.switcher, "2", destination)
+        assert handed.removal_error == "the keychain went away"
+        assert json.loads(destination.read_text()) == stored
+
+    def test_an_interrupt_after_the_login_went_keeps_the_file(
+        self, seeded, stored, tmp_path, monkeypatch
+    ):
+        def interrupted(slot, assume_yes=False):
+            seeded.switcher._delete_account_credentials(slot, "b@example.com")
+            raise KeyboardInterrupt
+
+        monkeypatch.setattr(seeded.switcher, "remove_account", interrupted)
+        destination = tmp_path / "login.json"
+        with pytest.raises(KeyboardInterrupt):
+            api.hand_over_login(seeded.switcher, "2", destination)
+        assert json.loads(destination.read_text()) == stored
+
+    def test_hands_over_the_login_its_session_profile_renewed(
+        self, seeded, stored, tmp_path
+    ):
+        from claude_swap.session import session_dir_for
+
+        profile = session_dir_for(seeded.switcher.backup_dir, "2", "b@example.com")
+        profile.mkdir(parents=True)
+        renewed = _login(refresh="rt-2-renewed", expiresAt=1_950_000_000_000)
+        (profile / ".credentials.json").write_text(json.dumps(renewed))
+        destination = tmp_path / "login.json"
+        api.hand_over_login(seeded.switcher, "2", destination)
+        assert json.loads(destination.read_text()) == renewed
+        assert _numbers(seeded) == [1]
+
+    def test_hands_over_a_renewal_claude_swap_set_aside(
+        self, seeded, stored, tmp_path
+    ):
+        from claude_swap.oauth import credential_fingerprint
+
+        successor = _login(refresh="rt-2-successor", expiresAt=1_950_000_000_000)
+        seeded.switcher._store._write_unclaimed_credential(
+            json.dumps(successor),
+            {
+                "reason": "consume-gate-unpersisted",
+                "configSlot": "2",
+                "consumedFp": credential_fingerprint(json.dumps(stored)),
+                "fingerprint": credential_fingerprint(json.dumps(successor)),
+            },
+        )
+        destination = tmp_path / "login.json"
+        api.hand_over_login(seeded.switcher, "2", destination)
+        assert json.loads(destination.read_text()) == successor
+        assert seeded.switcher.list_unclaimed_credentials() == {}
+
+    def test_waits_for_a_renewal_of_the_account(
+        self, seeded, stored, tmp_path, monkeypatch
+    ):
+        from claude_swap.locking import FileLock
+
+        monkeypatch.setattr(api, "HAND_OVER_LOCK_TIMEOUT", 0.2)
+        destination = tmp_path / "login.json"
+        with (
+            FileLock(seeded.switcher.consume_lock_file("2")),
+            pytest.raises(api.LockError, match="being renewed"),
+        ):
+            api.hand_over_login(seeded.switcher, "2", destination)
+        assert not destination.exists()
+        assert _numbers(seeded) == [1, 2]
+        api.hand_over_login(seeded.switcher, "2", destination)
+        assert _numbers(seeded) == [1]
+
+    def test_unknown_account_raises(self, seeded, tmp_path):
+        with pytest.raises(api.AccountNotFoundError):
+            api.hand_over_login(seeded.switcher, "9", tmp_path / "login.json")
+
+    def test_refuses_a_foreign_profile(self, seeded, monkeypatch, tmp_path):
+        monkeypatch.setenv("CLAUDE_CONFIG_DIR", str(tmp_path / "hand-made"))
+        with pytest.raises(api.ConfigError, match="CLAUDE_CONFIG_DIR"):
+            api.hand_over_login(seeded.switcher, "2", tmp_path / "login.json")

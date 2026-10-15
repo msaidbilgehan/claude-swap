@@ -18,6 +18,7 @@ orchestration would re-couple. The store owns only its two pieces of state:
 from __future__ import annotations
 
 import base64
+import contextlib
 import json
 import logging
 import os
@@ -33,7 +34,7 @@ from claude_swap.exceptions import (
     CredentialReadError,
     CredentialWriteError,
 )
-from claude_swap.fsutil import replace_with_retry
+from claude_swap.fsutil import replace_with_retry, sync_file, sync_folder
 from claude_swap.models import Platform
 from claude_swap.paths import (
     get_claude_config_home,
@@ -1162,7 +1163,13 @@ class CredentialStore:
         self._atomic_b64_write(self._backup_enc_path(account_num, email), credentials)
 
     def _atomic_b64_write(self, target: Path, credentials: str) -> None:
-        """Atomically write a base64-encoded credential file (0600)."""
+        """Atomically write a base64-encoded credential file (0600).
+
+        sak.11: the new file is flushed to the disk before it replaces the old
+        one, and the folder after (best effort: a file system that cannot
+        flush keeps the old behaviour). Outside the Keychain this file is the
+        account's only copy of a login whose old refresh token no longer works.
+        """
         self._host.credentials_dir.mkdir(parents=True, exist_ok=True)
         enc_file = target
         encoded = base64.b64encode(credentials.encode("utf-8")).decode("utf-8")
@@ -1170,9 +1177,12 @@ class CredentialStore:
         fd, tmp_path = tempfile.mkstemp(dir=str(self._host.credentials_dir), suffix=".tmp")
         try:
             os.write(fd, encoded.encode("utf-8"))
+            with contextlib.suppress(OSError):
+                sync_file(fd)
             os.close(fd)
             fd = -1
             replace_with_retry(tmp_path, str(enc_file))
+            sync_folder(enc_file.parent)
             if sys.platform != "win32":
                 os.chmod(str(enc_file), 0o600)
         except BaseException:

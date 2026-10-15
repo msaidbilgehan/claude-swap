@@ -45,6 +45,7 @@ import sys
 import tempfile
 import time
 import unicodedata
+from collections.abc import Collection, Mapping
 from pathlib import Path
 from typing import TYPE_CHECKING, NoReturn
 
@@ -550,20 +551,48 @@ def _mkdir_private(path: Path) -> None:
         directory.mkdir(mode=0o700, exist_ok=True)
 
 
-def _probe_env(session_dir: Path) -> dict[str, str]:
-    """Env for the auth-status probe: session config dir, auth overrides dropped."""
-    env = {k: v for k, v in os.environ.items() if k not in AUTH_OVERRIDE_ENV_VARS}
+def child_env(
+    removed: Collection[str], extra_env: Mapping[str, str] | None = None
+) -> dict[str, str]:
+    """The environment of a ``claude`` that claude-swap starts on its own:
+    this process's environment without ``removed``, plus ``extra_env`` (what
+    an embedding program adds, such as its privacy settings) without
+    ``removed`` either. The caller sets its own variables after this, so
+    they win over ``extra_env`` too."""
+    env = {k: v for k, v in os.environ.items() if k not in removed}
+    for name, value in (extra_env or {}).items():
+        if name not in removed:
+            env[name] = value
+    return env
+
+
+def _probe_env(
+    session_dir: Path, extra_env: Mapping[str, str] | None = None
+) -> dict[str, str]:
+    """Env for the auth-status probe: session config dir, auth overrides dropped
+    (from ``extra_env`` too, whose other variables are added)."""
+    env = child_env(AUTH_OVERRIDE_ENV_VARS, extra_env)
     env["CLAUDE_CONFIG_DIR"] = str(session_dir)
     return env
 
 
 class SessionManager:
-    """Bootstraps per-account session profiles and launches Claude into them."""
+    """Bootstraps per-account session profiles and launches Claude into them.
 
-    def __init__(self, switcher: ClaudeAccountSwitcher):
+    ``extra_env`` (sak.11) is added to the environment of the ``claude auth
+    status`` probe that checks a profile (see :func:`_probe_env`).
+    """
+
+    def __init__(
+        self,
+        switcher: ClaudeAccountSwitcher,
+        *,
+        extra_env: Mapping[str, str] | None = None,
+    ):
         self.switcher = switcher
         self.sessions_dir = switcher.backup_dir / "sessions"
         self._logger = switcher._logger
+        self._extra_env = dict(extra_env or {})
 
     # -- launch ----------------------------------------------------------
 
@@ -1013,7 +1042,7 @@ class SessionManager:
         try:
             result = subprocess.run(
                 [claude_bin, "auth", "status", "--json"],
-                env=_probe_env(session_dir),
+                env=_probe_env(session_dir, self._extra_env),
                 capture_output=True,
                 text=True,
                 timeout=_AUTH_STATUS_TIMEOUT,

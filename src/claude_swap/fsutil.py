@@ -7,10 +7,16 @@ the paths/models/usage_store import cycle.
 
 from __future__ import annotations
 
+import contextlib
 import os
 import sys
 import time
 from pathlib import Path
+
+if sys.platform != "win32":
+    import fcntl
+else:  # pragma: no cover - Windows has no fcntl
+    fcntl = None
 
 # Windows error codes that usually mean "someone else has the file open right
 # now": ERROR_ACCESS_DENIED, ERROR_SHARING_VIOLATION and ERROR_LOCK_VIOLATION.
@@ -99,3 +105,38 @@ def replace_with_retry(
                 raise
             time.sleep(delay)
             delay = min(delay * 2, 0.25)
+
+
+def sync_file(fd: int) -> None:
+    """Flush the open file ``fd`` to the disk itself (sak.11).
+
+    On macOS a plain ``fsync`` only hands the data to the drive, which may
+    keep it in its cache through a power loss; ``F_FULLFSYNC`` asks the drive
+    to write it out. A file system that does not take ``F_FULLFSYNC`` gets
+    the plain ``fsync``. Raises ``OSError`` when the data cannot be flushed.
+    """
+    full = getattr(fcntl, "F_FULLFSYNC", None) if fcntl is not None else None
+    if full is not None:
+        try:
+            fcntl.fcntl(fd, full)
+            return
+        except OSError:
+            pass  # not supported here: the plain fsync below
+    os.fsync(fd)
+
+
+def sync_folder(folder: os.PathLike | str) -> None:
+    """Make a new or renamed entry of ``folder`` survive a power loss (best
+    effort: Windows cannot open a folder for this, and some file systems
+    refuse it)."""
+    if sys.platform == "win32":
+        return
+    try:
+        fd = os.open(folder, os.O_RDONLY)
+    except OSError:
+        return
+    try:
+        with contextlib.suppress(OSError):
+            sync_file(fd)
+    finally:
+        os.close(fd)

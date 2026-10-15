@@ -271,3 +271,59 @@ class TestSecureStorageOverride:
         store = CredentialStore(_Host(tmp_path / "backups"))
         assert store._read_active_credentials().value == SECURE_PROFILE_CREDS
         assert seen == [keychain_service_name(str(secure))]
+
+
+class TestBackupFileIsFlushed:
+    """sak.11: outside the Keychain the backup file is the account's only copy
+    of a login (its old refresh token no longer works), so it reaches the disk
+    before it replaces the old file."""
+
+    def test_the_file_is_flushed_before_it_replaces_the_old_one(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ):
+        import base64
+
+        from claude_swap import credentials
+
+        steps: list[str] = []
+        real_replace = credentials.replace_with_retry
+
+        def replace(src: str, dst: str) -> None:
+            steps.append("replace")
+            real_replace(src, dst)
+
+        def sync_folder(folder: Path) -> None:
+            steps.append(f"folder {Path(folder).name}")
+
+        monkeypatch.setattr(credentials, "sync_file", lambda fd: steps.append("file"))
+        monkeypatch.setattr(credentials, "sync_folder", sync_folder)
+        monkeypatch.setattr(credentials, "replace_with_retry", replace)
+        backups = tmp_path / "backups"
+        target = backups / ".creds-1-a@example.com.enc"
+
+        store = CredentialStore(_Host(backups))
+        store._atomic_b64_write(target, DEFAULT_PROFILE_CREDS)
+
+        assert steps == ["file", "replace", "folder backups"]
+        assert base64.b64decode(target.read_text()).decode() == DEFAULT_PROFILE_CREDS
+
+    def test_a_file_system_that_cannot_flush_still_gets_the_file(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ):
+        import base64
+        import errno
+
+        from claude_swap import credentials
+
+        def cannot_flush(fd: int) -> None:
+            raise OSError(errno.EINVAL, "not supported")
+
+        monkeypatch.setattr(credentials, "sync_file", cannot_flush)
+        backups = tmp_path / "backups"
+        target = backups / ".creds-1-a@example.com.enc"
+
+        store = CredentialStore(_Host(backups))
+        store._atomic_b64_write(target, DEFAULT_PROFILE_CREDS)
+
+        assert base64.b64decode(target.read_text()).decode() == DEFAULT_PROFILE_CREDS
+        assert sorted(p.name for p in backups.iterdir()) == [target.name]

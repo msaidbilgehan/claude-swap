@@ -32,6 +32,7 @@ from claude_swap.session import (
     SHARE_MANIFEST,
     SessionManager,
     _probe_env,
+    child_env,
     keychain_service_name,
     profile_is_quiescent,
     read_session_identity,
@@ -234,6 +235,28 @@ class TestHelpers:
         assert "ANTHROPIC_API_KEY" not in env
         assert "CLAUDE_CODE_OAUTH_TOKEN" not in env
         assert env["CLAUDE_CONFIG_DIR"] == str(tmp_path)
+
+    def test_probe_env_adds_extra_env_under_its_own(self, monkeypatch, tmp_path):
+        monkeypatch.setenv("DISABLE_TELEMETRY", "0")
+        env = _probe_env(
+            tmp_path,
+            {
+                "DISABLE_TELEMETRY": "1",
+                "CLAUDE_CONFIG_DIR": "/elsewhere",
+                "ANTHROPIC_API_KEY": "sk-key",
+            },
+        )
+        assert env["DISABLE_TELEMETRY"] == "1"
+        assert env["CLAUDE_CONFIG_DIR"] == str(tmp_path)
+        assert "ANTHROPIC_API_KEY" not in env
+
+    def test_child_env_keeps_removed_names_out_of_extra_env(self, monkeypatch):
+        monkeypatch.setenv("KEPT", "here")
+        monkeypatch.setenv("GONE", "here")
+        env = child_env(("GONE", "NEVER"), {"NEVER": "x", "ADDED": "y"})
+        assert env["KEPT"] == "here"
+        assert env["ADDED"] == "y"
+        assert "GONE" not in env and "NEVER" not in env
 
     def test_scan_live_sessions_missing_dir(self, tmp_path):
         assert scan_live_sessions(tmp_path / "nope") == ([], 0)
