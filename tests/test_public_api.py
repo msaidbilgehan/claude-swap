@@ -13,6 +13,8 @@ import inspect
 import json
 import os
 import sys
+import threading
+import time
 from pathlib import Path
 
 import pytest
@@ -26,6 +28,7 @@ from tests.test_autoswitch import EngineHarness
 
 EXPECTED_ALL = [
     "SCHEMA_VERSION",
+    "AccessTokenInfo",
     "AccountNotFoundError",
     "AddedAccount",
     "AllExhaustedEvent",
@@ -58,6 +61,7 @@ EXPECTED_ALL = [
     "SwitchEvent",
     "UnquarantineEvent",
     "ValidationError",
+    "access_token",
     "accounts_json",
     "active_account",
     "add_current_login",
@@ -66,10 +70,12 @@ EXPECTED_ALL = [
     "add_setup_token",
     "check_login_source",
     "create_engine",
+    "forget_access_login",
     "forget_profile_login",
     "hand_over_login",
     "import_login",
     "inject_system_trust",
+    "keep_access_login",
     "live_session_accounts",
     "map_project",
     "open_switcher",
@@ -178,6 +184,19 @@ EXPECTED_SIGNATURES = {
     ),
     "version": "() -> 'str'",
     "inject_system_trust": "() -> 'bool'",
+    "access_token": (
+        "(switcher: 'ClaudeAccountSwitcher', identifier: 'str', *, "
+        "renew_within: 'float' = 0.0) -> 'AccessTokenInfo'"
+    ),
+    "keep_access_login": (
+        "(config_dir: 'str | os.PathLike[str]', *, access_token: 'str', "
+        "expires_at: 'str', scopes: 'Sequence[str]', "
+        "subscription_type: 'str | None', rate_limit_tier: 'str | None', "
+        "email: 'str', organization_uuid: 'str | None', "
+        "organization: 'str | None', account_uuid: 'str | None', "
+        "share_history: 'bool' = True) -> 'None'"
+    ),
+    "forget_access_login": "(config_dir: 'str | os.PathLike[str]') -> 'None'",
 }
 
 ACCOUNT_ROW_KEYS = {
@@ -2476,3 +2495,1120 @@ class TestHandOverLogin:
         monkeypatch.setenv("CLAUDE_CONFIG_DIR", str(tmp_path / "hand-made"))
         with pytest.raises(api.ConfigError, match="CLAUDE_CONFIG_DIR"):
             api.hand_over_login(seeded.switcher, "2", tmp_path / "login.json")
+
+
+# -- an access token for another computer (sak.12) ----------------------------------
+
+
+def _in(*, minutes: float = 0, hours: float = 0) -> int:
+    """Epoch milliseconds that far from now."""
+    return int((time.time() + minutes * 60 + hours * 3600) * 1000)
+
+
+def _token_login(access: str, refresh: str | None, expires: int, **extra) -> dict:
+    """A login as Claude Code keeps it, with what an access token carries."""
+    entry = {
+        "accessToken": access,
+        "refreshToken": refresh,
+        "expiresAt": expires,
+        "scopes": _SCOPES,
+        "subscriptionType": "max",
+        "rateLimitTier": "default_claude_max_20x",
+        **extra,
+    }
+    return {"claudeAiOauth": entry}
+
+
+class _TokenEndpoint:
+    """Anthropic's token endpoint: a refresh token renews its login once."""
+
+    def __init__(self) -> None:
+        self.posted: list[str] = []
+        self.error: str | None = None
+        self.during = None
+
+    def __call__(self, credentials: str, timeout_s: float = 10.0) -> RefreshOutcome:
+        data = json.loads(credentials)
+        entry = data["claudeAiOauth"]
+        refresh = entry.get("refreshToken")
+        if not refresh:
+            return RefreshOutcome(None, "no_refresh_token")
+        self.posted.append(refresh)
+        if self.during is not None:
+            self.during()
+        if self.error is not None:
+            return RefreshOutcome(None, self.error)
+        renewed = {
+            **entry,
+            "accessToken": f"sk-ant-oat01-renewed-{len(self.posted)}",
+            "refreshToken": f"{refresh}-next",
+            "expiresAt": _in(hours=8),
+        }
+        return RefreshOutcome(json.dumps({**data, "claudeAiOauth": renewed}), None)
+
+
+@pytest.fixture
+def endpoint(monkeypatch) -> _TokenEndpoint:
+    fake = _TokenEndpoint()
+    monkeypatch.setattr("claude_swap.oauth.try_refresh_oauth_credentials", fake)
+    return fake
+
+
+def _stored(seeded, num: int = 2, email: str = "b@example.com") -> dict:
+    return json.loads(seeded.switcher.read_account_credentials(str(num), email))
+
+
+def _keep_stored(seeded, login: dict, num: int = 2, email: str = "b@example.com"):
+    seeded.switcher._write_account_credentials(str(num), email, json.dumps(login))
+
+
+def _session_profile(seeded, num: int = 2, email: str = "b@example.com") -> Path:
+    from claude_swap.session import session_dir_for
+
+    profile = session_dir_for(seeded.switcher.backup_dir, str(num), email)
+    profile.mkdir(parents=True, exist_ok=True)
+    return profile
+
+
+def _run_session_in(profile: Path) -> None:
+    (profile / "sessions").mkdir(parents=True, exist_ok=True)
+    (profile / "sessions" / f"{os.getpid()}.json").write_text(
+        json.dumps({"pid": os.getpid(), "sessionId": "s", "cwd": "/"})
+    )
+
+
+def _live(seeded) -> dict:
+    return json.loads(
+        (seeded.temp_home / ".claude" / ".credentials.json").read_text()
+    )
+
+
+def _make_live(seeded, login: dict) -> None:
+    (seeded.temp_home / ".claude" / ".credentials.json").write_text(json.dumps(login))
+
+
+def _profile_of_account_one(_token: str) -> dict:
+    """What Anthropic answers when asked whose a token of account 1 is."""
+    return {
+        "uuid": "uuid-1",
+        "email": "a@example.com",
+        "organizationUuid": None,
+        "organizationName": None,
+    }
+
+
+class TestAccessToken:
+    """An account's newest access token, renewed first when it is due (sak.12)."""
+
+    def test_hands_out_a_login_that_is_not_due_as_it_is(
+        self, seeded, endpoint, capfd
+    ):
+        expires = _in(hours=3)
+        _keep_stored(seeded, _token_login("sk-ant-oat01-b", "rt-2", expires))
+        data = seeded.switcher._get_sequence_data()
+        data["accounts"]["2"]["organizationUuid"] = "org-2"
+        data["accounts"]["2"]["organizationName"] = "Team"
+        seeded.switcher._write_json(seeded.switcher.sequence_file, data)
+        capfd.readouterr()
+        info = api.access_token(seeded.switcher, "b@example.com", renew_within=900)
+        _assert_silent(capfd)
+        assert info == api.AccessTokenInfo(
+            slot="2",
+            email="b@example.com",
+            organization_uuid="org-2",
+            organization="Team",
+            account_uuid="uuid-2",
+            access_token="sk-ant-oat01-b",
+            expires_at=api._instant(expires),
+            scopes=tuple(_SCOPES),
+            subscription_type="max",
+            rate_limit_tier="default_claude_max_20x",
+            renewed=False,
+        )
+        assert endpoint.posted == []
+        assert "sk-ant-oat01-b" not in repr(info)
+        assert "sk-ant-oat01-b" not in str(info)
+
+    def test_the_expiry_is_iso_utc_with_milliseconds(self, seeded, endpoint):
+        _keep_stored(seeded, _token_login("sk-a", "rt-2", 1_900_000_000_123))
+        info = api.access_token(seeded.switcher, "2")
+        assert info.expires_at == "2030-03-17T17:46:40.123Z"
+
+    def test_renews_a_login_that_is_due_and_keeps_the_new_one(
+        self, seeded, endpoint, capfd
+    ):
+        _keep_stored(seeded, _token_login("sk-old", "rt-2", _in(minutes=10)))
+        capfd.readouterr()
+        info = api.access_token(seeded.switcher, "2", renew_within=900)
+        _assert_silent(capfd)
+        assert endpoint.posted == ["rt-2"]
+        assert info.renewed is True
+        assert info.access_token == "sk-ant-oat01-renewed-1"
+        stored = _stored(seeded)["claudeAiOauth"]
+        assert stored["accessToken"] == "sk-ant-oat01-renewed-1"
+        assert stored["refreshToken"] == "rt-2-next"
+        assert info.expires_at == api._instant(stored["expiresAt"])
+        # the next call has nothing to renew
+        again = api.access_token(seeded.switcher, "2", renew_within=900)
+        assert again.renewed is False
+        assert again.access_token == info.access_token
+        assert endpoint.posted == ["rt-2"]
+
+    def test_renew_within_zero_renews_only_a_lapsed_token(self, seeded, endpoint):
+        _keep_stored(seeded, _token_login("sk-soon", "rt-2", _in(minutes=2)))
+        assert api.access_token(seeded.switcher, "2").renewed is False
+        _keep_stored(seeded, _token_login("sk-gone", "rt-2", _in(minutes=-1)))
+        assert api.access_token(seeded.switcher, "2").renewed is True
+        assert endpoint.posted == ["rt-2"]
+
+    def test_takes_in_what_its_cswap_run_profile_renewed(self, seeded, endpoint):
+        _keep_stored(seeded, _token_login("sk-old", "rt-2", _in(minutes=-30)))
+        newer = _token_login("sk-ant-oat01-profile", "rt-2b", _in(hours=7))
+        profile = _session_profile(seeded)
+        (profile / ".credentials.json").write_text(json.dumps(newer))
+        info = api.access_token(seeded.switcher, "2", renew_within=900)
+        assert info.access_token == "sk-ant-oat01-profile"
+        assert info.renewed is False
+        assert endpoint.posted == []
+        assert _stored(seeded) == newer
+
+    def test_never_renews_a_login_a_running_session_holds(self, seeded, endpoint):
+        login = _token_login("sk-due", "rt-2", _in(minutes=10))
+        _keep_stored(seeded, login)
+        profile = _session_profile(seeded)
+        (profile / ".credentials.json").write_text(json.dumps(login))
+        _run_session_in(profile)
+        with pytest.raises(api.SessionError, match="renews it itself"):
+            api.access_token(seeded.switcher, "2", renew_within=900)
+        assert endpoint.posted == []
+        assert _stored(seeded) == login
+        # not due yet: handed out as it is, nothing renewed
+        assert api.access_token(seeded.switcher, "2").access_token == "sk-due"
+        assert endpoint.posted == []
+
+    def test_a_running_sessions_newer_login_is_handed_out_as_it_is(
+        self, seeded, endpoint
+    ):
+        stored = _token_login("sk-old", "rt-2", _in(minutes=-30))
+        _keep_stored(seeded, stored)
+        profile = _session_profile(seeded)
+        newer = _token_login("sk-ant-oat01-live", "rt-2b", _in(hours=7))
+        (profile / ".credentials.json").write_text(json.dumps(newer))
+        _run_session_in(profile)
+        info = api.access_token(seeded.switcher, "2", renew_within=900)
+        assert info.access_token == "sk-ant-oat01-live"
+        assert endpoint.posted == []
+        assert _stored(seeded) == stored  # the running session owns the newer one
+
+    def test_a_session_on_another_login_does_not_hold_this_one(
+        self, seeded, endpoint
+    ):
+        _keep_stored(seeded, _token_login("sk-due", "rt-2", _in(minutes=10)))
+        profile = _session_profile(seeded)
+        (profile / ".claude.json").write_text(
+            json.dumps({"oauthAccount": {"emailAddress": "c@example.com"}})
+        )
+        _run_session_in(profile)
+        assert api.access_token(seeded.switcher, "2", renew_within=900).renewed
+        assert endpoint.posted == ["rt-2"]
+
+    def test_takes_in_a_renewal_claude_swap_set_aside(self, seeded, endpoint):
+        from claude_swap.oauth import credential_fingerprint
+
+        stored = _token_login("sk-old", "rt-2", _in(minutes=-30))
+        _keep_stored(seeded, stored)
+        successor = _token_login("sk-ant-oat01-aside", "rt-2-next", _in(hours=7))
+        seeded.switcher._store._write_unclaimed_credential(
+            json.dumps(successor),
+            {
+                "reason": "consume-gate-persist-failed",
+                "configSlot": "2",
+                "consumedFp": credential_fingerprint(json.dumps(stored)),
+                "fingerprint": credential_fingerprint(json.dumps(successor)),
+            },
+        )
+        info = api.access_token(seeded.switcher, "2", renew_within=900)
+        assert info.access_token == "sk-ant-oat01-aside"
+        assert endpoint.posted == []
+        assert seeded.switcher.list_unclaimed_credentials() == {}
+
+    @pytest.mark.parametrize(
+        ("error", "kind", "match"),
+        [
+            ("invalid_grant", api.CredentialError, "no longer works"),
+            ("transient", api.CredentialError, "could not be renewed now"),
+            ("invalid_client", api.CredentialError, "invalid_client"),
+        ],
+    )
+    def test_a_renewal_that_fails_says_why(self, seeded, endpoint, error, kind, match):
+        login = _token_login("sk-due", "rt-2", _in(minutes=10))
+        _keep_stored(seeded, login)
+        endpoint.error = error
+        with pytest.raises(kind, match=match):
+            api.access_token(seeded.switcher, "2", renew_within=900)
+        assert _stored(seeded) == login
+
+    def test_waits_for_a_renewal_or_a_switch_under_way(
+        self, seeded, endpoint, monkeypatch
+    ):
+        from claude_swap.locking import FileLock
+
+        _keep_stored(seeded, _token_login("sk-due", "rt-2", _in(minutes=10)))
+        monkeypatch.setattr(api, "ACCESS_TOKEN_LOCK_TIMEOUT", 0.2)
+        for held in (seeded.switcher.consume_lock_file("2"), seeded.switcher.lock_file):
+            with (
+                FileLock(held),
+                pytest.raises(api.LockError, match="being renewed or switched"),
+            ):
+                api.access_token(seeded.switcher, "2", renew_within=900)
+        assert endpoint.posted == []
+        assert api.access_token(seeded.switcher, "2", renew_within=900).renewed
+
+    def test_a_switch_to_the_account_waits_for_its_renewal(self, seeded, endpoint):
+        sw = seeded.switcher
+        live = _token_login("sk-a", "rt-1", _in(hours=3))
+        _make_live(seeded, live)
+        _keep_stored(seeded, live, 1, "a@example.com")
+        # 12 minutes left: renewed with renew_within=900, while the auto-switch
+        # engine (10 minutes) calls it fresh and may switch to it meanwhile
+        _keep_stored(seeded, _token_login("sk-b", "rt-2", _in(minutes=12)))
+        switch = threading.Thread(target=lambda: sw.switch_to("2", json_output=True))
+
+        def a_switch_lands() -> None:
+            switch.start()
+            switch.join(timeout=0.5)
+            assert switch.is_alive()  # it waits for claude-swap's lock
+
+        endpoint.during = a_switch_lands
+        info = api.access_token(sw, "2", renew_within=900)
+        switch.join(timeout=15)
+        assert info.renewed is True
+        assert sw.current_account_number() == "2"
+        # the switch put the renewed login in the default profile, not the spent one
+        assert _live(seeded)["claudeAiOauth"]["refreshToken"] == "rt-2-next"
+        assert _stored(seeded)["claudeAiOauth"]["refreshToken"] == "rt-2-next"
+        assert endpoint.posted == ["rt-2"]
+
+    def test_refuses_while_claude_code_keeps_its_login_elsewhere(
+        self, seeded, endpoint, monkeypatch
+    ):
+        _keep_stored(seeded, _token_login("sk-b", "rt-2", _in(hours=3)))
+        _make_live(seeded, _token_login("sk-a", "rt-1", _in(hours=3)))
+        monkeypatch.setenv("CLAUDE_SECURESTORAGE_CONFIG_DIR", "/elsewhere")
+        for slot in ("1", "2"):
+            with pytest.raises(api.ConfigError, match="CLAUDE_SECURESTORAGE_CONFIG_DIR"):
+                api.access_token(seeded.switcher, slot)
+        assert endpoint.posted == []
+
+    def test_a_renewal_set_aside_that_cannot_be_read_says_so(
+        self, seeded, endpoint, monkeypatch
+    ):
+        _keep_stored(seeded, _token_login("sk-due", "rt-2", _in(minutes=10)))
+
+        def unreadable(*_a):
+            raise api.CredentialReadError("the unclaimed manifest is unreadable")
+
+        monkeypatch.setattr(seeded.switcher, "_adopt_stashed_successor", unreadable)
+        with pytest.raises(api.CredentialReadError, match="set aside"):
+            api.access_token(seeded.switcher, "2", renew_within=900)
+        assert endpoint.posted == []
+
+    def test_a_renewal_that_cannot_be_stored_is_set_aside_and_taken_in(
+        self, seeded, endpoint, monkeypatch
+    ):
+        from claude_swap.oauth import credential_fingerprint
+
+        old = _token_login("sk-due", "rt-2", _in(minutes=10))
+        _keep_stored(seeded, old)
+
+        def full_disk(*_a):
+            raise OSError(28, "No space left on device")
+
+        with monkeypatch.context() as patched:
+            patched.setattr(seeded.switcher, "_write_account_credentials", full_disk)
+            info = api.access_token(seeded.switcher, "2", renew_within=900)
+        assert info.renewed is True
+        assert info.access_token == "sk-ant-oat01-renewed-1"
+        assert _stored(seeded) == old
+        (aside,) = seeded.switcher.list_unclaimed_credentials().values()
+        assert aside["configSlot"] == "2"
+        assert aside["consumedFp"] == credential_fingerprint(json.dumps(old))
+        # the next call takes it in instead of renewing the spent login again
+        again = api.access_token(seeded.switcher, "2", renew_within=900)
+        assert again.access_token == "sk-ant-oat01-renewed-1"
+        assert again.renewed is False
+        assert endpoint.posted == ["rt-2"]
+        assert _stored(seeded)["claudeAiOauth"]["refreshToken"] == "rt-2-next"
+        assert seeded.switcher.list_unclaimed_credentials() == {}
+
+    def test_a_login_added_again_meanwhile_is_kept(self, seeded, endpoint):
+        _keep_stored(seeded, _token_login("sk-due", "rt-2", _in(minutes=10)))
+        added = _token_login("sk-added", "rt-added", _in(hours=8))
+        # adding an account does not wait for claude-swap's lock
+        endpoint.during = lambda: _keep_stored(seeded, added)
+        info = api.access_token(seeded.switcher, "2", renew_within=900)
+        assert info.renewed is True
+        assert info.access_token == "sk-ant-oat01-renewed-1"
+        assert _stored(seeded) == added
+        (aside,) = seeded.switcher.list_unclaimed_credentials().values()
+        assert aside["reason"] == "consume-gate-cas-conflict"
+        again = api.access_token(seeded.switcher, "2", renew_within=900)
+        assert (again.access_token, again.renewed) == ("sk-added", False)
+        assert seeded.switcher.list_unclaimed_credentials() == {}  # retired
+        assert endpoint.posted == ["rt-2"]
+
+    def test_a_login_removed_meanwhile_is_not_brought_back(self, seeded, endpoint):
+        _keep_stored(seeded, _token_login("sk-due", "rt-2", _in(minutes=10)))
+        endpoint.during = lambda: seeded.switcher._delete_account_credentials(
+            "2", "b@example.com"
+        )
+        info = api.access_token(seeded.switcher, "2", renew_within=900)
+        assert info.renewed is True
+        assert seeded.switcher.read_account_credentials("2", "b@example.com") == ""
+        (aside,) = seeded.switcher.list_unclaimed_credentials().values()
+        assert aside["reason"] == "consume-gate-slot-removed"
+
+    def test_a_session_on_an_older_login_does_not_hold_the_new_one(
+        self, seeded, endpoint
+    ):
+        profile = _session_profile(seeded)
+        (profile / ".credentials.json").write_text(
+            json.dumps(_token_login("sk-old", "rt-old", _in(minutes=-30)))
+        )
+        _run_session_in(profile)
+        # the account was logged in again meanwhile: a login of its own
+        _keep_stored(seeded, _token_login("sk-new", "rt-new", _in(minutes=10)))
+        info = api.access_token(seeded.switcher, "2", renew_within=900)
+        assert info.renewed is True
+        assert endpoint.posted == ["rt-new"]
+
+    def test_a_session_whose_login_cannot_be_read_holds_it(
+        self, seeded, endpoint, macos, monkeypatch
+    ):
+        from claude_swap import macos_keychain
+
+        _keep_stored(seeded, _token_login("sk-due", "rt-2", _in(minutes=10)))
+        _run_session_in(_session_profile(seeded))
+
+        def locked(_service, _account):
+            raise macos_keychain.KeychainError("the keychain is locked")
+
+        monkeypatch.setattr(macos_keychain, "get_password", locked)
+        with pytest.raises(api.SessionError, match="renews it itself"):
+            api.access_token(seeded.switcher, "2", renew_within=900)
+        assert endpoint.posted == []
+
+    def test_refuses_a_login_without_scopes(self, seeded, endpoint):
+        login = _token_login("sk-b", "rt-2", _in(hours=3))
+        del login["claudeAiOauth"]["scopes"]
+        _keep_stored(seeded, login)
+        with pytest.raises(api.ValidationError, match="no scopes"):
+            api.access_token(seeded.switcher, "2")
+        assert endpoint.posted == []
+
+    @pytest.mark.parametrize(
+        ("stored", "kind", "match"),
+        [
+            ("sk-ant-api03-key", api.ValidationError, "API key"),
+            (
+                json.dumps({
+                    "claudeAiOauth": {
+                        "accessToken": "sk-ant-oat01-x",
+                        "scopes": ["user:inference"],
+                    }
+                }),
+                api.ValidationError,
+                "setup-token",
+            ),
+            ("", api.CredentialError, "has no stored login"),
+        ],
+    )
+    def test_refuses_an_account_with_no_access_token_to_hand_out(
+        self, seeded, endpoint, stored, kind, match
+    ):
+        if stored:
+            seeded.switcher._write_account_credentials("2", "b@example.com", stored)
+        else:
+            seeded.switcher._delete_account_credentials("2", "b@example.com")
+        with pytest.raises(kind, match=match):
+            api.access_token(seeded.switcher, "2", renew_within=900)
+        assert endpoint.posted == []
+
+    @pytest.mark.parametrize("value", [-1, float("nan"), float("inf"), True, "900"])
+    def test_refuses_a_renew_within_that_is_no_duration(self, seeded, value):
+        with pytest.raises(api.ValidationError, match="renew_within"):
+            api.access_token(seeded.switcher, "2", renew_within=value)
+
+    def test_unknown_account_raises(self, seeded):
+        with pytest.raises(api.AccountNotFoundError):
+            api.access_token(seeded.switcher, "9")
+
+    def test_refuses_a_foreign_profile(self, seeded, monkeypatch, tmp_path):
+        monkeypatch.setenv("CLAUDE_CONFIG_DIR", str(tmp_path / "hand-made"))
+        with pytest.raises(api.ConfigError, match="CLAUDE_CONFIG_DIR"):
+            api.access_token(seeded.switcher, "2")
+
+
+class TestAccessTokenOfTheDefaultLogin:
+    """The account Claude Code's default profile runs on: its live login."""
+
+    def test_hands_out_the_default_profiles_login(self, seeded, endpoint, capfd):
+        live = _token_login("sk-ant-oat01-live", "rt-1", _in(hours=3))
+        _make_live(seeded, live)
+        capfd.readouterr()
+        info = api.access_token(seeded.switcher, "1", renew_within=900)
+        _assert_silent(capfd)
+        assert info.slot == "1"
+        assert info.access_token == "sk-ant-oat01-live"
+        assert info.renewed is False
+        assert endpoint.posted == []
+
+    def test_renews_it_under_claude_codes_locks_and_writes_it_back(
+        self, seeded, endpoint
+    ):
+        from claude_swap import claude_locks
+
+        live = _token_login("sk-due", "rt-1", _in(minutes=10))
+        _make_live(seeded, live)
+        _keep_stored(seeded, live, 1, "a@example.com")
+        held: list[bool] = []
+        endpoint.during = lambda: held.append(
+            claude_locks.oauth_refresh_lock_dir().is_dir()
+            and claude_locks.credentials_lock_dir().is_dir()
+            and seeded.switcher.consume_lock_file("1").exists()
+        )
+        info = api.access_token(seeded.switcher, "1", renew_within=900)
+        assert endpoint.posted == ["rt-1"]
+        assert held == [True]
+        assert info.renewed is True
+        assert info.access_token == "sk-ant-oat01-renewed-1"
+        assert _live(seeded)["claudeAiOauth"]["refreshToken"] == "rt-1-next"
+        stored = _stored(seeded, 1, "a@example.com")
+        assert stored["claudeAiOauth"]["refreshToken"] == "rt-1-next"
+        assert not claude_locks.oauth_refresh_lock_dir().exists()
+        assert not claude_locks.credentials_lock_dir().exists()
+
+    def test_a_renewal_claude_code_made_is_confirmed_and_taken(
+        self, seeded, endpoint, monkeypatch
+    ):
+        _keep_stored(
+            seeded, _token_login("sk-1", "rt-1", _in(hours=-1)), 1, "a@example.com"
+        )
+        fresh = _token_login("sk-ant-oat01-cc", "rt-1-cc", _in(hours=8))
+        _make_live(seeded, fresh)
+        monkeypatch.setattr(
+            "claude_swap.oauth.fetch_oauth_profile", _profile_of_account_one
+        )
+        info = api.access_token(seeded.switcher, "1", renew_within=900)
+        assert info.access_token == "sk-ant-oat01-cc"
+        assert info.renewed is False
+        assert endpoint.posted == []
+        assert _stored(seeded, 1, "a@example.com") == fresh
+
+    def test_a_renewal_claude_code_makes_meanwhile_is_confirmed_first(
+        self, seeded, endpoint, monkeypatch
+    ):
+        due = _token_login("sk-due", "rt-1", _in(minutes=10))
+        _make_live(seeded, due)
+        _keep_stored(seeded, due, 1, "a@example.com")
+        fresh = _token_login("sk-ant-oat01-cc", "rt-1-cc", _in(hours=8))
+        confirm = api._confirm_live
+
+        def claude_code_renews(*args) -> None:
+            confirm(*args)
+            _make_live(seeded, fresh)  # after claude-swap looked, before its locks
+
+        monkeypatch.setattr(api, "_confirm_live", claude_code_renews)
+        with pytest.raises(api.CredentialError, match="not confirmed"):
+            api.access_token(seeded.switcher, "1", renew_within=900)
+        assert endpoint.posted == []
+        assert _live(seeded) == fresh
+        monkeypatch.setattr(api, "_confirm_live", confirm)
+        monkeypatch.setattr(
+            "claude_swap.oauth.fetch_oauth_profile", _profile_of_account_one
+        )
+        info = api.access_token(seeded.switcher, "1", renew_within=900)
+        assert info.access_token == "sk-ant-oat01-cc"
+        assert info.renewed is False
+        assert endpoint.posted == []
+
+    def test_another_accounts_login_is_never_handed_out_under_its_name(
+        self, seeded, endpoint, monkeypatch
+    ):
+        _keep_stored(
+            seeded, _token_login("sk-a", "rt-1", _in(hours=3)), 1, "a@example.com"
+        )
+        _make_live(seeded, _token_login("sk-ant-oat01-z", "rt-z", _in(hours=3)))
+        with pytest.raises(api.CredentialError, match="not confirmed"):
+            api.access_token(seeded.switcher, "1")
+        monkeypatch.setattr(
+            "claude_swap.oauth.fetch_oauth_profile",
+            lambda token: {
+                "uuid": "uuid-9",
+                "email": "z@example.com",
+                "organizationUuid": "",
+                "organizationName": None,
+            },
+        )
+        with pytest.raises(api.CredentialError, match="another account's login"):
+            api.access_token(seeded.switcher, "1")
+        assert endpoint.posted == []
+
+    def test_a_switch_waits_until_its_login_is_read(
+        self, seeded, endpoint, monkeypatch
+    ):
+        from claude_swap.locking import FileLock
+
+        sw = seeded.switcher
+        live = _token_login("sk-ant-oat01-a", "rt-1", _in(hours=3))
+        _make_live(seeded, live)
+        _keep_stored(seeded, live, 1, "a@example.com")
+        _keep_stored(seeded, _token_login("sk-ant-oat01-b", "rt-2", _in(hours=3)))
+        read = sw._read_active_credentials
+        switch = threading.Thread(target=lambda: sw.switch_to("2", json_output=True))
+        landed: list[bool] = []
+
+        def read_while_a_switch_lands():
+            if not landed and not FileLock(sw.lock_file, timeout=0).acquire():
+                # access_token holds claude-swap's lock: a switch comes now
+                landed.append(True)
+                switch.start()
+                switch.join(timeout=0.5)
+                assert switch.is_alive()  # it waits for that lock
+            return read()
+
+        monkeypatch.setattr(sw, "_read_active_credentials", read_while_a_switch_lands)
+        info = api.access_token(sw, "1")
+        switch.join(timeout=15)
+        assert landed
+        assert (info.slot, info.access_token) == ("1", "sk-ant-oat01-a")
+        assert sw.current_account_number() == "2"  # it went ahead afterwards
+        assert _live(seeded)["claudeAiOauth"]["accessToken"] == "sk-ant-oat01-b"
+
+    def test_is_not_renewed_while_its_session_holds_the_same_login(
+        self, seeded, endpoint
+    ):
+        due = _token_login("sk-due", "rt-1", _in(minutes=10))
+        _make_live(seeded, due)
+        _keep_stored(seeded, due, 1, "a@example.com")
+        profile = _session_profile(seeded, 1, "a@example.com")
+        (profile / ".credentials.json").write_text(json.dumps(due))
+        _run_session_in(profile)
+        with pytest.raises(api.SessionError, match="renews it itself"):
+            api.access_token(seeded.switcher, "1", renew_within=900)
+        assert endpoint.posted == []
+        assert api.access_token(seeded.switcher, "1").access_token == "sk-due"
+        # a session on another login of the account does not hold this one
+        (profile / ".credentials.json").write_text(
+            json.dumps(_token_login("sk-o", "rt-other", _in(hours=1)))
+        )
+        assert api.access_token(seeded.switcher, "1", renew_within=900).renewed
+        assert endpoint.posted == ["rt-1"]
+
+    def test_a_renewal_neither_store_takes_is_set_aside_and_taken_in(
+        self, seeded, endpoint, monkeypatch
+    ):
+        due = _token_login("sk-due", "rt-1", _in(minutes=10))
+        _make_live(seeded, due)
+        _keep_stored(seeded, due, 1, "a@example.com")
+
+        def full_disk(*_a):
+            raise OSError(28, "No space left on device")
+
+        with monkeypatch.context() as patched:
+            patched.setattr(seeded.switcher, "_write_account_credentials", full_disk)
+            patched.setattr(seeded.switcher, "_write_credentials", full_disk)
+            info = api.access_token(seeded.switcher, "1", renew_within=900)
+        assert info.renewed is True
+        assert _live(seeded) == due
+        assert len(seeded.switcher.list_unclaimed_credentials()) == 1
+        from claude_swap import claude_locks
+
+        write = seeded.switcher._write_credentials
+        locked: list[bool] = []
+
+        def write_under_claude_codes_locks(credentials: str) -> None:
+            locked.append(
+                claude_locks.oauth_refresh_lock_dir().is_dir()
+                and claude_locks.credentials_lock_dir().is_dir()
+            )
+            write(credentials)
+
+        monkeypatch.setattr(
+            seeded.switcher, "_write_credentials", write_under_claude_codes_locks
+        )
+        again = api.access_token(seeded.switcher, "1", renew_within=900)
+        assert locked == [True]  # put back where Claude Code reads it, under its lock
+        assert again.access_token == info.access_token
+        assert again.renewed is False
+        assert endpoint.posted == ["rt-1"]
+        assert _live(seeded)["claudeAiOauth"]["refreshToken"] == "rt-1-next"
+        stored = _stored(seeded, 1, "a@example.com")
+        assert stored["claudeAiOauth"]["refreshToken"] == "rt-1-next"
+        assert seeded.switcher.list_unclaimed_credentials() == {}
+
+    def test_a_lapsed_login_it_cannot_check_says_what_helps(self, seeded, endpoint):
+        _keep_stored(
+            seeded, _token_login("sk-s", "rt-s", _in(hours=-3)), 1, "a@example.com"
+        )
+        _make_live(seeded, _token_login("sk-l", "rt-l", _in(minutes=-5)))
+        with pytest.raises(
+            api.CredentialError, match="Use Claude Code on this computer once"
+        ):
+            api.access_token(seeded.switcher, "1")
+        assert endpoint.posted == []
+
+    def test_an_unconfirmed_login_is_not_renewed(self, seeded, endpoint):
+        _keep_stored(
+            seeded, _token_login("sk-1", "rt-1", _in(hours=-1)), 1, "a@example.com"
+        )
+        live = _token_login("sk-due", "rt-elsewhere", _in(minutes=10))
+        _make_live(seeded, live)
+        with pytest.raises(api.CredentialError, match="not confirmed"):
+            api.access_token(seeded.switcher, "1", renew_within=900)
+        assert endpoint.posted == []
+        assert _live(seeded) == live
+
+    def test_a_login_anthropic_confirms_is_renewed(
+        self, seeded, endpoint, monkeypatch
+    ):
+        _keep_stored(
+            seeded, _token_login("sk-1", "rt-1", _in(hours=-1)), 1, "a@example.com"
+        )
+        _make_live(seeded, _token_login("sk-due", "rt-cc", _in(minutes=10)))
+        monkeypatch.setattr(
+            "claude_swap.oauth.fetch_oauth_profile",
+            lambda token: {
+                "uuid": "uuid-1",
+                "email": "a@example.com",
+                "organizationUuid": None,
+                "organizationName": None,
+            },
+        )
+        info = api.access_token(seeded.switcher, "1", renew_within=900)
+        assert endpoint.posted == ["rt-cc"]
+        assert info.renewed is True
+        assert _live(seeded)["claudeAiOauth"]["refreshToken"] == "rt-cc-next"
+
+    def test_an_unreadable_default_login_is_refused(
+        self, seeded, endpoint, monkeypatch
+    ):
+        from claude_swap.credentials import ActiveCredentials
+
+        _make_live(seeded, _token_login("sk-live", "rt-1", _in(hours=3)))
+        for verdict in (
+            ActiveCredentials(None, False),
+            ActiveCredentials("x", False, True),
+            ActiveCredentials("", True, True),
+        ):
+            monkeypatch.setattr(
+                seeded.switcher, "_read_active_credentials", lambda v=verdict: v
+            )
+            with pytest.raises(api.CredentialError, match="cannot be read now"):
+                api.access_token(seeded.switcher, "1")
+
+    def test_a_logged_out_default_profile_has_no_login(self, seeded, endpoint):
+        (seeded.temp_home / ".claude" / ".credentials.json").unlink()
+        with pytest.raises(api.CredentialError, match="has no login now"):
+            api.access_token(seeded.switcher, "1")
+
+    def test_waits_for_a_renewal_under_way(self, seeded, endpoint, monkeypatch):
+        from claude_swap.locking import FileLock
+
+        due = _token_login("sk-due", "rt-1", _in(minutes=10))
+        _make_live(seeded, due)
+        _keep_stored(seeded, due, 1, "a@example.com")
+        monkeypatch.setattr(api, "ACCESS_TOKEN_LOCK_TIMEOUT", 0.2)
+        with (
+            FileLock(seeded.switcher.consume_lock_file("1")),
+            pytest.raises(api.LockError, match="being renewed"),
+        ):
+            api.access_token(seeded.switcher, "1", renew_within=900)
+        assert endpoint.posted == []
+        assert api.access_token(seeded.switcher, "1", renew_within=900).renewed
+
+
+_KEPT = {
+    "access_token": "sk-ant-oat01-kept",
+    "expires_at": "2026-10-16T21:47:12.345Z",
+    "scopes": ("user:profile", "user:inference"),
+    "subscription_type": "max",
+    "rate_limit_tier": "default_claude_max_20x",
+    "email": "b@example.com",
+    "organization_uuid": "org-2",
+    "organization": "Team",
+    "account_uuid": "uuid-2",
+}
+
+
+@pytest.fixture
+def macos(monkeypatch, block_real_keychain):
+    """Claude Code's macOS stores: the profile's Keychain item comes first."""
+    from claude_swap import session
+
+    monkeypatch.setattr(
+        session.Platform, "detect", classmethod(lambda _cls: Platform.MACOS)
+    )
+    return block_real_keychain
+
+
+def _item_name(profile: Path) -> tuple[str, str]:
+    from claude_swap import macos_keychain, session
+
+    return session.keychain_service_name(str(profile)), (
+        macos_keychain.keychain_account_name()
+    )
+
+
+def _kept_login(profile: Path) -> dict:
+    return json.loads((profile / ".credentials.json").read_text())
+
+
+def _another_spelling(folder: Path, tmp_path: Path, spelling: str) -> str:
+    """``folder`` named another way that reaches the same folder; skips the
+    test where this disk has no such spelling."""
+    if spelling == "slash":
+        return str(folder) + os.sep
+    if spelling == "case":
+        place = folder.parent / folder.name.upper()
+    elif spelling == "firmlink":
+        place = Path("/System/Volumes/Data" + str(folder.resolve()))
+    elif spelling == "symlink":
+        place = tmp_path / f"link-to-{folder.name}"
+        try:
+            place.symlink_to(folder, target_is_directory=True)
+        except OSError:
+            pytest.skip("this system cannot make a symlink here")
+    else:  # "dotdot"
+        place = folder / "projects" / ".." / ".." / folder.name
+    if not os.path.isdir(place) or not os.path.samefile(place, folder):
+        pytest.skip(f"this disk has no {spelling} spelling of {folder}")
+    return str(place)
+
+
+class TestKeepAccessLogin:
+    """A profile that runs on another computer's access token (sak.12)."""
+
+    @pytest.fixture
+    def profile(self, temp_home, no_stdin, tmp_path) -> Path:
+        return tmp_path / "synced" / "b"
+
+    def test_makes_a_profile_that_runs_on_the_token(self, temp_home, profile, capfd):
+        (temp_home / ".claude" / "settings.json").write_text("{}")
+        (temp_home / ".claude.json").write_text(json.dumps({"theme": "light"}))
+        capfd.readouterr()
+        api.keep_access_login(profile, **_KEPT)
+        _assert_silent(capfd)
+        assert _kept_login(profile) == {
+            "claudeAiOauth": {
+                "accessToken": "sk-ant-oat01-kept",
+                "refreshToken": None,
+                "expiresAt": 1_792_187_232_345,
+                "scopes": ["user:profile", "user:inference"],
+                "subscriptionType": "max",
+                "rateLimitTier": "default_claude_max_20x",
+            }
+        }
+        assert (profile / ".credentials.json").stat().st_mode & 0o777 == 0o600
+        config = json.loads((profile / ".claude.json").read_text())
+        assert config["oauthAccount"] == {
+            "accountUuid": "uuid-2",
+            "emailAddress": "b@example.com",
+            "organizationUuid": "org-2",
+            "organizationName": "Team",
+        }
+        assert config["hasCompletedOnboarding"] is True
+        assert config["theme"] == "light"
+        if sys.platform != "win32":
+            assert (profile / "settings.json").is_symlink()
+            assert profile.stat().st_mode & 0o777 == 0o700
+
+    def test_the_expiry_round_trips_with_access_token(
+        self, seeded, endpoint, tmp_path
+    ):
+        _keep_stored(seeded, _token_login("sk-a", "rt-2", 1_900_000_000_123))
+        info = api.access_token(seeded.switcher, "2")
+        profile = tmp_path / "synced" / "b"
+        api.keep_access_login(
+            profile,
+            access_token=info.access_token,
+            expires_at=info.expires_at,
+            scopes=info.scopes,
+            subscription_type=info.subscription_type,
+            rate_limit_tier=info.rate_limit_tier,
+            email=info.email,
+            organization_uuid=info.organization_uuid,
+            organization=info.organization,
+            account_uuid=info.account_uuid,
+        )
+        assert _kept_login(profile)["claudeAiOauth"]["expiresAt"] == 1_900_000_000_123
+
+    def test_replaces_the_token_and_keeps_what_claude_code_keeps_besides(
+        self, profile
+    ):
+        profile.mkdir(parents=True)
+        (profile / ".credentials.json").write_text(json.dumps({
+            **_token_login("sk-old", None, 1),
+            "mcpOAuth": {"server": {"accessToken": "mcp"}},
+        }))
+        api.keep_access_login(profile, **_KEPT)
+        kept = _kept_login(profile)
+        assert kept["claudeAiOauth"]["accessToken"] == "sk-ant-oat01-kept"
+        assert kept["mcpOAuth"] == {"server": {"accessToken": "mcp"}}
+
+    def test_moves_the_keychain_item_into_the_file(self, macos, profile):
+        profile.mkdir(parents=True)
+        (profile / ".credentials.json").write_text("stale")
+        before = (profile / ".credentials.json").stat().st_mtime_ns
+        macos.set_password(
+            *_item_name(profile),
+            json.dumps({
+                **_token_login("sk-old", None, 1),
+                "mcpOAuth": {"server": {"accessToken": "mcp"}},
+            }),
+        )
+        api.keep_access_login(profile, **_KEPT)
+        assert macos.get_password(*_item_name(profile)) is None
+        kept = _kept_login(profile)
+        assert kept["claudeAiOauth"]["accessToken"] == "sk-ant-oat01-kept"
+        assert kept["mcpOAuth"] == {"server": {"accessToken": "mcp"}}
+        assert (profile / ".credentials.json").stat().st_mtime_ns > before
+
+    def test_an_unreadable_keychain_item_changes_nothing(
+        self, macos, profile, monkeypatch
+    ):
+        from claude_swap import macos_keychain
+
+        def locked(_service, _account):
+            raise macos_keychain.KeychainError("the keychain is locked")
+
+        monkeypatch.setattr(macos_keychain, "get_password", locked)
+        with pytest.raises(api.CredentialReadError, match="cannot be read now"):
+            api.keep_access_login(profile, **_KEPT)
+        assert not (profile / ".credentials.json").exists()
+
+    def test_refuses_a_profile_someone_logged_in_to(self, macos, profile):
+        profile.mkdir(parents=True)
+        own = json.dumps(_token_login("sk-own", "rt-own", _in(hours=8)))
+        (profile / ".credentials.json").write_text(own)
+        with pytest.raises(api.ConfigError, match="login of its own"):
+            api.keep_access_login(profile, **_KEPT)
+        assert (profile / ".credentials.json").read_text() == own
+        (profile / ".credentials.json").unlink()
+        macos.set_password(*_item_name(profile), own)
+        with pytest.raises(api.ConfigError, match="login of its own"):
+            api.keep_access_login(profile, **_KEPT)
+        assert macos.get_password(*_item_name(profile)) == own
+        assert not (profile / ".credentials.json").exists()
+
+    def test_keeps_what_claude_code_recorded_about_the_same_account(self, profile):
+        profile.mkdir(parents=True)
+        (profile / ".claude.json").write_text(json.dumps({
+            "projects": {"/x": {}},
+            "theme": "dark",
+            "oauthAccount": {
+                "emailAddress": "b@example.com",
+                "organizationUuid": "org-2",
+                "displayName": "Bee",
+            },
+        }))
+        api.keep_access_login(profile, **_KEPT)
+        config = json.loads((profile / ".claude.json").read_text())
+        assert config["projects"] == {"/x": {}}
+        assert config["oauthAccount"]["displayName"] == "Bee"
+        assert config["oauthAccount"]["accountUuid"] == "uuid-2"
+        api.keep_access_login(profile, **{**_KEPT, "email": "c@example.com"})
+        config = json.loads((profile / ".claude.json").read_text())
+        assert "displayName" not in config["oauthAccount"]
+        assert config["oauthAccount"]["emailAddress"] == "c@example.com"
+
+    def test_refuses_places_that_are_not_its_own(self, temp_home, no_stdin, tmp_path):
+        from claude_swap.paths import get_backup_root
+
+        a_file = tmp_path / "file"
+        a_file.write_text("x")
+        for place, match in (
+            (temp_home / ".claude", "default profile"),
+            (temp_home / ".claude" / "inner", "default profile"),
+            (temp_home, "default profile"),
+            (get_backup_root() / "synced", "own store"),
+            ("relative/b", "full path"),
+            ("", "Name the profile folder"),
+            (a_file, "not a folder"),
+        ):
+            with pytest.raises(api.ConfigError, match=match):
+                api.keep_access_login(place, **_KEPT)
+            with pytest.raises(api.ConfigError, match=match):
+                api.forget_access_login(place)
+
+    @pytest.mark.parametrize(
+        "spelling", ["case", "firmlink", "symlink", "dotdot", "slash"]
+    )
+    def test_refuses_the_default_profile_by_any_spelling(
+        self, temp_home, no_stdin, tmp_path, spelling
+    ):
+        claude = temp_home / ".claude"
+        transcript = claude / "projects" / "-x" / "session.jsonl"
+        transcript.parent.mkdir(parents=True)
+        transcript.write_text("{}\n")
+        (claude / "history.jsonl").write_text('{"display":"hi"}\n')
+        place = _another_spelling(claude, tmp_path, spelling)
+        for where in (place, os.path.join(place, "synced")):
+            with pytest.raises(api.ConfigError, match="default profile"):
+                api.keep_access_login(where, **_KEPT)
+            with pytest.raises(api.ConfigError, match="default profile"):
+                api.forget_access_login(where)
+        # refused before anything was written or merged
+        assert transcript.read_text() == "{}\n"
+        assert (claude / "history.jsonl").read_text() == '{"display":"hi"}\n'
+        assert not (claude / ".credentials.json").exists()
+        assert not (claude / "synced").exists()
+
+    @pytest.mark.parametrize("spelling", ["case", "symlink"])
+    def test_refuses_claude_swaps_store_by_another_spelling(
+        self, temp_home, no_stdin, tmp_path, spelling
+    ):
+        from claude_swap.paths import get_backup_root
+
+        store = get_backup_root()
+        store.mkdir(parents=True)
+        place = _another_spelling(store, tmp_path, spelling)
+        with pytest.raises(api.ConfigError, match="own store"):
+            api.keep_access_login(os.path.join(place, "sessions", "b"), **_KEPT)
+        assert not (store / "sessions").exists()
+
+    def test_leaves_no_copy_of_the_token_behind(self, profile, monkeypatch):
+        profile.mkdir(parents=True)
+        stray = profile / "..credentials.json.k3x9q2.tmp"
+        stray.write_text(json.dumps(_token_login("sk-ant-oat01-old", None, 1)))
+        mine = profile / "notes.tmp"
+        mine.write_text("mine")
+        synced: list[Path] = []
+        monkeypatch.setattr(api, "sync_folder", lambda folder: synced.append(Path(folder)))
+        api.keep_access_login(profile, **_KEPT)
+        assert not stray.exists()  # a dead write's copy is swept
+        assert mine.read_text() == "mine"
+        assert profile in synced  # the rename itself is on the disk
+
+        def failing_disk(_fd):
+            raise OSError(5, "Input/output error")
+
+        monkeypatch.setattr(api, "sync_file", failing_disk)
+        with pytest.raises(api.CredentialWriteError):
+            api.keep_access_login(profile, **{**_KEPT, "access_token": "sk-ant-oat01-n"})
+        leftovers = sorted(p.name for p in profile.iterdir() if p.name.endswith(".tmp"))
+        assert leftovers == ["notes.tmp"]
+        assert _kept_login(profile)["claudeAiOauth"]["accessToken"] == (
+            "sk-ant-oat01-kept"
+        )
+
+    @pytest.mark.parametrize(
+        ("change", "match"),
+        [
+            ({"access_token": "sk-ant-api03-key"}, "API key"),
+            ({"access_token": "sk-ant-ort01-refresh"}, "refresh token"),
+            ({"access_token": ""}, "access token"),
+            ({"access_token": "two tokens"}, "access token"),
+            ({"expires_at": "2026-10-16T21:47:00"}, "zone"),
+            ({"expires_at": "soon"}, "zone"),
+            ({"scopes": ()}, "scopes"),
+            ({"scopes": "user:inference"}, "scopes"),
+            ({"scopes": ("user inference",)}, "scopes"),
+            ({"email": " "}, "email"),
+        ],
+    )
+    def test_refuses_values_that_are_not_what_they_should_be(
+        self, profile, change, match
+    ):
+        with pytest.raises(api.ValidationError, match=match):
+            api.keep_access_login(profile, **{**_KEPT, **change})
+        assert not profile.exists()
+
+    def test_waits_for_claude_codes_lock(self, profile, monkeypatch):
+        from claude_swap import claude_locks
+
+        monkeypatch.setattr(claude_locks, "DEFAULT_TIMEOUT_S", 0.3)
+        lock = claude_locks.storage_write_lock_dir(profile)
+        lock.mkdir(parents=True)
+        with pytest.raises(api.LockError, match="right now"):
+            api.keep_access_login(profile, **_KEPT)
+        assert not (profile / ".credentials.json").exists()
+        stale = time.time() - claude_locks.STORAGE_WRITE_STALENESS_S - 5
+        os.utime(lock, (stale, stale))
+        api.keep_access_login(profile, **_KEPT)
+        assert _kept_login(profile)["claudeAiOauth"]["accessToken"] == (
+            "sk-ant-oat01-kept"
+        )
+        assert not lock.exists()
+
+    @pytest.mark.skipif(sys.platform == "win32", reason="history is linked on POSIX")
+    def test_shares_history_with_the_default_profile(self, temp_home, profile):
+        (temp_home / ".claude" / "projects").mkdir()
+        api.keep_access_login(profile, **_KEPT)
+        assert (profile / "projects").is_symlink()
+        other = profile.parent / "c"
+        api.keep_access_login(other, **_KEPT, share_history=False)
+        assert not (other / "projects").exists()
+
+
+class TestForgetAccessLogin:
+    @pytest.fixture
+    def profile(self, temp_home, no_stdin, tmp_path) -> Path:
+        profile = tmp_path / "synced" / "b"
+        api.keep_access_login(profile, **_KEPT)
+        return profile
+
+    def test_removes_the_kept_token_and_leaves_the_folder(self, profile, capfd):
+        capfd.readouterr()
+        api.forget_access_login(profile)
+        api.forget_access_login(profile)  # gone already is fine
+        api.forget_access_login(profile.parent / "never-made")
+        _assert_silent(capfd)
+        assert not (profile / ".credentials.json").exists()
+        assert (profile / ".claude.json").exists()
+
+    def test_removes_the_keychain_item_too(self, macos, profile):
+        macos.set_password(
+            *_item_name(profile), json.dumps(_token_login("sk-x", None, 1))
+        )
+        api.forget_access_login(profile)
+        assert macos.get_password(*_item_name(profile)) is None
+        assert not (profile / ".credentials.json").exists()
+
+    def test_refuses_a_login_someone_made_there(self, profile):
+        own = json.dumps(_token_login("sk-own", "rt-own", _in(hours=8)))
+        (profile / ".credentials.json").write_text(own)
+        with pytest.raises(api.ConfigError, match="login of its own"):
+            api.forget_access_login(profile)
+        assert (profile / ".credentials.json").read_text() == own
+
+    def test_keeps_what_claude_code_keeps_besides(self, profile):
+        mcp = {"server": {"accessToken": "mcp"}}
+        (profile / ".credentials.json").write_text(
+            json.dumps({**_kept_login(profile), "mcpOAuth": mcp})
+        )
+        api.forget_access_login(profile)
+        assert _kept_login(profile) == {"mcpOAuth": mcp}
+        assert (profile / ".credentials.json").stat().st_mode & 0o777 == 0o600
+
+    def test_keeps_it_when_claude_code_moved_it_into_the_keychain_item(
+        self, macos, profile
+    ):
+        mcp = {"server": {"accessToken": "mcp"}}
+        macos.set_password(
+            *_item_name(profile), json.dumps({**_kept_login(profile), "mcpOAuth": mcp})
+        )
+        (profile / ".credentials.json").unlink()
+        api.forget_access_login(profile)
+        assert macos.get_password(*_item_name(profile)) is None
+        assert _kept_login(profile) == {"mcpOAuth": mcp}
+
+    def test_a_login_that_stays_is_an_error(self, macos, profile, monkeypatch):
+        from claude_swap import macos_keychain
+
+        def locked(_service, _account):
+            raise macos_keychain.KeychainError("the keychain is locked")
+
+        monkeypatch.setattr(macos_keychain, "delete_password", locked)
+        with pytest.raises(api.CredentialError, match="keychain"):
+            api.forget_access_login(profile)

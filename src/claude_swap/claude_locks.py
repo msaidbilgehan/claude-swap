@@ -59,6 +59,11 @@ TOUCH_INTERVAL_S = 3.0
 # Note this is a PER-LOCK budget: claude_credentials_lock acquires two locks
 # sequentially, so its worst case is ~2x this value.
 DEFAULT_TIMEOUT_S = 9.0
+# Claude Code's secure-storage write lock (2.1.292: proper-lockfile on
+# ``<config-dir>/.storage-write``, ``stale: 15000``): every change it makes to
+# a profile's stored credentials (a renewal, an MCP server's login) is a
+# read-modify-write under it.
+STORAGE_WRITE_STALENESS_S = 15.0
 
 _logger = logging.getLogger("claude-swap")
 
@@ -80,6 +85,14 @@ def config_lock_dir() -> Path:
     """Lock directory guarding the global config file (``~/.claude.json.lock``)."""
     path = get_global_config_path()
     return path.parent / (path.name + ".lock")
+
+
+def storage_write_lock_dir(config_dir: Path) -> Path:
+    """Claude Code's secure-storage write lock of a profile
+    (``<config-dir>/.storage-write.lock``); hold it with
+    ``staleness=STORAGE_WRITE_STALENESS_S`` while changing the profile's
+    stored credentials, so a write of Claude Code's own is never lost."""
+    return config_dir / ".storage-write.lock"
 
 
 @contextmanager

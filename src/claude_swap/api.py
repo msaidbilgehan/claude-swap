@@ -30,18 +30,22 @@ import contextlib
 import io
 import json
 import logging
+import math
 import os
 import shutil
 import subprocess
+import tempfile
 import threading
 import time
-from collections.abc import Callable, Collection, Iterator, Mapping
+import unicodedata
+from collections.abc import Callable, Collection, Iterator, Mapping, Sequence
 from dataclasses import dataclass
+from datetime import datetime, timedelta, timezone
 from importlib.metadata import version as _dist_version
 from pathlib import Path
-from typing import Any, NamedTuple
+from typing import Any, NamedTuple, cast
 
-from claude_swap import oauth
+from claude_swap import macos_keychain, oauth
 from claude_swap.autoswitch import (
     AllExhaustedEvent,
     AutoSwitcherInstance,
@@ -57,19 +61,29 @@ from claude_swap.autoswitch import (
     UnquarantineEvent,
     running_instances,
 )
+from claude_swap.claude_locks import (
+    CONFIG_STALENESS_S,
+    STORAGE_WRITE_STALENESS_S,
+    claude_config_lock,
+    claude_credentials_lock,
+    proper_lockfile,
+    storage_write_lock_dir,
+)
 from claude_swap.credentials import CLAUDE_CODE_KEYCHAIN_SERVICE, looks_like_api_key
 from claude_swap.exceptions import (
     AccountNotFoundError,
+    ClaudeCodeLockTimeout,
     ClaudeSwitchError,
     ConfigError,
     CredentialError,
     CredentialReadError,
+    CredentialWriteError,
     LockError,
     SessionError,
     SwitchError,
     ValidationError,
 )
-from claude_swap.fsutil import sync_file, sync_folder
+from claude_swap.fsutil import replace_with_retry, sync_file, sync_folder
 from claude_swap.json_output import SCHEMA_VERSION
 from claude_swap.locking import FileLock
 from claude_swap.models import Platform, get_timestamp, normalize_alias
@@ -78,19 +92,29 @@ from claude_swap.oauth import (
     is_setup_token,
     login_expires_at_iso,
 )
-from claude_swap.paths import get_claude_config_home, get_default_claude_config_home
+from claude_swap.paths import (
+    get_backup_root,
+    get_claude_config_home,
+    get_default_claude_config_home,
+    get_default_global_config_path,
+    get_legacy_backup_root,
+)
 from claude_swap.session import (
     AUTH_OVERRIDE_ENV_VARS,
     SessionManager,
     child_env,
     forget_config_dir_login,
+    keychain_service_name,
+    profile_is_quiescent,
     read_config_dir_credentials,
+    session_identity_drifted,
 )
-from claude_swap.settings import AutoSwitchSettings, load_settings
+from claude_swap.settings import AutoSwitchSettings, atomic_write_json, load_settings
 from claude_swap.switcher import ClaudeAccountSwitcher
 
 __all__ = [
     "SCHEMA_VERSION",
+    "AccessTokenInfo",
     "AccountNotFoundError",
     "AddedAccount",
     "AllExhaustedEvent",
@@ -123,6 +147,7 @@ __all__ = [
     "SwitchEvent",
     "UnquarantineEvent",
     "ValidationError",
+    "access_token",
     "accounts_json",
     "active_account",
     "add_current_login",
@@ -131,10 +156,12 @@ __all__ = [
     "add_setup_token",
     "check_login_source",
     "create_engine",
+    "forget_access_login",
     "forget_profile_login",
     "hand_over_login",
     "import_login",
     "inject_system_trust",
+    "keep_access_login",
     "live_session_accounts",
     "map_project",
     "open_switcher",
@@ -803,12 +830,54 @@ def _oauth_entry(credentials: str) -> dict[str, Any] | None:
     return entry if isinstance(entry, dict) else None
 
 
-def _inside(path: Path, root: Path) -> bool:
+def _identity(path: Path) -> tuple[int, int] | None:
+    """What ``path`` names, as the file system tells files apart (device and
+    inode, after symlinks), or ``None`` when it cannot be looked at."""
     try:
-        resolved, base = path.resolve(), root.resolve()
-    except OSError:
+        status = path.stat()
+    except (OSError, ValueError):
+        return None
+    return status.st_dev, status.st_ino
+
+
+def _anchor(path: Path) -> tuple[Path, tuple[int, int] | None, tuple[str, ...]]:
+    """``path``'s nearest existing folder (itself when it exists), that
+    folder's identity, and the names below it that do not exist yet."""
+    try:
+        full = path.resolve()
+    except (OSError, RuntimeError):  # a symlink loop
+        full = Path(os.path.abspath(path))
+    below: list[str] = []
+    current = full
+    while True:
+        identity = _identity(current)
+        if identity is not None or current.parent == current:
+            return current, identity, tuple(reversed(below))
+        below.append(current.name)
+        current = current.parent
+
+
+def _folded(names: Sequence[str]) -> tuple[str, ...]:
+    """Names as a case-insensitive disk compares them."""
+    return tuple(unicodedata.normalize("NFC", name).casefold() for name in names)
+
+
+def _inside(path: Path, root: Path) -> bool:
+    """Whether ``path`` is ``root`` or lies inside it, as the file system
+    sees it: by file identity, so another spelling of the same folder counts
+    too (letter case on a case-insensitive disk, macOS's
+    ``/System/Volumes/Data`` firmlink, a symlink, ``..``, a trailing slash).
+    A path or root that does not exist yet compares through its nearest
+    existing folder and the names below it (letter case ignored)."""
+    place, place_id, below = _anchor(path)
+    _, root_id, root_below = _anchor(root)
+    if place_id is None or root_id is None:
         return False
-    return resolved == base or base in resolved.parents
+    if not root_below:
+        return any(_identity(folder) == root_id for folder in (place, *place.parents))
+    return place_id == root_id and _folded(below[: len(root_below)]) == _folded(
+        root_below
+    )
 
 
 def _refuse_own_store(switcher: ClaudeAccountSwitcher, path: Path) -> None:
@@ -1893,3 +1962,1122 @@ def hand_over_login(
             )
             return handed._replace(removal_error=str(e) or type(e).__name__)
     return handed
+
+
+# -- an access token for another computer (sak.12) ----------------------------------
+
+ACCESS_TOKEN_LOCK_TIMEOUT = 15.0
+"""How long :func:`access_token` waits for the account's consume lock and
+claude-swap's own lock: a renewal of the account's login holds them for its
+request (bounded at 10 s), a switch for its local writes."""
+
+_LOCKED_RENEWAL_TIMEOUT = 6.0
+"""The request bound of a renewal made under claude-swap's own lock (and,
+for the default profile's login, Claude Code's credential locks too): well
+inside the 10 s a switch waits for that lock, as in claude-swap's own locked
+renewal of the default profile's login."""
+
+_UNMIRRORED = (
+    "CLAUDE_SECURESTORAGE_CONFIG_DIR is set, so Claude Code keeps its login "
+    "where claude-swap does not look; unset it and try again."
+)
+
+# Why a renewal :func:`access_token` made was set aside in claude-swap's
+# unclaimed store instead of stored: the consume gate's own reasons for the
+# same cases (``cswap unclaimed`` lists them). The next look at the account
+# takes the renewal in while the store still holds the login it renewed; a
+# CAS-conflict one is retired on sight, the store having moved on to a login
+# of its own.
+_ASIDE_PERSIST_FAILED = "consume-gate-persist-failed"
+_ASIDE_STORE_UNREADABLE = "consume-gate-store-unreadable"
+_ASIDE_SLOT_REMOVED = "consume-gate-slot-removed"
+_ASIDE_CAS_CONFLICT = "consume-gate-cas-conflict"
+
+_EPOCH = datetime(1970, 1, 1, tzinfo=timezone.utc)
+
+
+class AccessTokenInfo(NamedTuple):
+    """An account's access token, for another computer to use without its
+    login (:func:`access_token`, sak.12). ``repr`` never shows the token."""
+
+    slot: str
+    email: str
+    organization_uuid: str | None
+    organization: str | None
+    """The organization's name, when claude-swap recorded one."""
+    account_uuid: str | None
+    """Claude's id of the account (``oauthAccount.accountUuid``)."""
+    access_token: str
+    expires_at: str
+    """When the access token lapses: ISO 8601 UTC with milliseconds
+    (``2026-10-16T21:47:12.345Z``)."""
+    scopes: tuple[str, ...]
+    subscription_type: str | None
+    rate_limit_tier: str | None
+    renewed: bool
+    """This call renewed the login: the old refresh token is spent, and the
+    new login is stored wherever the old one was."""
+
+    def __repr__(self) -> str:
+        shown = ", ".join(
+            f"{name}={getattr(self, name)!r}"
+            for name in self._fields
+            if name != "access_token"
+        )
+        return f"AccessTokenInfo({shown}, access_token=<hidden>)"
+
+
+def _renew_window(renew_within: float) -> int:
+    """``renew_within`` in milliseconds; refuses what is not a duration."""
+    if (
+        isinstance(renew_within, bool)
+        or not isinstance(renew_within, (int, float))
+        or not math.isfinite(renew_within)
+        or renew_within < 0
+    ):
+        raise ValidationError(
+            f"renew_within is a number of seconds, 0 or more; not {renew_within!r}."
+        )
+    return int(renew_within * 1000)
+
+
+def _due(credentials: str, window_ms: int) -> bool:
+    """Whether the login's access token is missing or lapses within
+    ``window_ms`` from now (or has lapsed)."""
+    entry = _oauth_entry(credentials) or {}
+    token = entry.get("accessToken")
+    expires = entry.get("expiresAt")
+    if not isinstance(token, str) or not token.strip():
+        return True
+    if isinstance(expires, bool) or not isinstance(expires, (int, float)):
+        return True
+    return time.time() * 1000 + window_ms >= expires
+
+
+def _login_scopes(entry: Mapping[str, Any]) -> tuple[str, ...] | None:
+    """The login's scopes as :func:`keep_access_login` takes them (names
+    without spaces), or ``None`` when it has none it could keep."""
+    scopes = entry.get("scopes")
+    if not isinstance(scopes, list) or not scopes:
+        return None
+    if not all(
+        isinstance(s, str) and s and not any(c.isspace() for c in s) for s in scopes
+    ):
+        return None
+    return tuple(scopes)
+
+
+def _no_scopes(slot: str, email: str) -> ValidationError:
+    return ValidationError(
+        f"Account {slot} ({email})'s login does not say what it may do (it has no "
+        "scopes), so another computer could not use it; log in again."
+    )
+
+
+def _kind_refusal(
+    slot: str, email: str, org_uuid: str, login: str
+) -> ClaudeSwitchError | None:
+    """Why the account has no access token to hand out although it has
+    something stored, or ``None``."""
+    if looks_like_api_key(login):
+        return ValidationError(
+            f"Account {slot} ({email}) is an API key, not a login: it has no "
+            "access token to hand out."
+        )
+    if not org_uuid and is_setup_token(login):
+        return ValidationError(
+            f"Account {slot} ({email}) runs on a setup-token, not a login: add "
+            "the setup-token where it is needed instead."
+        )
+    entry = _oauth_entry(login)
+    if entry is None:
+        return CredentialError(
+            f"Account {slot} ({email})'s login is not one Claude Code keeps (no "
+            "claudeAiOauth entry); log in again."
+        )
+    if _login_scopes(entry) is None:
+        return _no_scopes(slot, email)
+    return None
+
+
+def _live_unreadable(slot: str, email: str) -> CredentialReadError:
+    return CredentialReadError(
+        f"The login of Claude Code's default profile (account {slot}, {email}) "
+        "cannot be read now (the Keychain is locked or busy); unlock it and try "
+        "again."
+    )
+
+
+def _renewal_failure(slot: str, email: str, error: str | None) -> ClaudeSwitchError:
+    """What a renewal that did not happen raises."""
+    who = f"Account {slot} ({email})"
+    if error == "invalid_grant":
+        return CredentialError(
+            f"{who}'s login no longer works: it was renewed, moved or logged out "
+            "elsewhere. Log in again."
+        )
+    if error == "no_refresh_token":
+        return CredentialError(
+            f"{who}'s login has no refresh token, so it cannot be renewed; log "
+            "in again."
+        )
+    if error == "invalid_client":
+        return CredentialError(
+            f"Anthropic refused to renew {who}'s login (invalid_client); the login "
+            "itself may still work. Try again later."
+        )
+    return CredentialError(
+        f"{who}'s login could not be renewed now (no connection, or Anthropic did "
+        "not answer); try again in a few minutes."
+    )
+
+
+def _session_renews_it(slot: str, email: str) -> SessionError:
+    return SessionError(
+        f"A Claude session runs on account {slot} ({email}) with this login, which "
+        "is due for renewal: that session renews it itself the next time it is "
+        "used (renewing it here would leave that session with a spent login). "
+        "Try again after that, or end the session."
+    )
+
+
+def _session_holds(
+    switcher: ClaudeAccountSwitcher, slot: str, email: str, org_uuid: str, login: str
+) -> bool:
+    """Whether a Claude session may be running on the account's ``cswap
+    run`` profile with ``login`` itself (the same refresh token), which that
+    session renews on its own: renewing it here would spend the session's
+    copy. A session record, or a login there, that cannot be read counts as
+    one; a session on another login of the account does not."""
+    session_dir = switcher._session_dir(slot, email)
+    if profile_is_quiescent(session_dir):
+        return False
+    if session_identity_drifted(session_dir, email, org_uuid):
+        return False
+    try:
+        held = read_config_dir_credentials(str(session_dir), strict_keychain=True)
+    except CredentialReadError:
+        return True
+    return bool(held) and credential_fingerprint(held) == credential_fingerprint(login)
+
+
+def _set_aside_unreadable(slot: str, email: str) -> CredentialReadError:
+    return CredentialReadError(
+        f"A renewal of account {slot} ({email})'s login that claude-swap set aside "
+        "cannot be read now (a locked Keychain?); unlock it and try again."
+    )
+
+
+def _take_in_set_aside(
+    switcher: ClaudeAccountSwitcher, slot: str, email: str, current: str
+) -> str | None:
+    """A renewal of ``current`` that claude-swap set aside because it could
+    not store it (the consume gate's, or :func:`access_token`'s own), now
+    the account's stored login; ``None`` when there is none. The caller
+    holds claude-swap's own lock."""
+    try:
+        return switcher._adopt_stashed_successor(slot, email, current)
+    except CredentialReadError as e:
+        raise _set_aside_unreadable(slot, email) from e
+
+
+def _set_aside(
+    switcher: ClaudeAccountSwitcher, slot: str, consumed: str, renewed: str, reason: str
+) -> None:
+    """Keep a renewal that was not stored in claude-swap's unclaimed store,
+    keyed by the login it renewed, as the consume gate keeps one: the next
+    look at the account takes it in. The old refresh token is spent, so the
+    new login must not be lost. Never raises."""
+    try:
+        switcher._store._write_unclaimed_credential(
+            renewed,
+            {
+                "reason": reason,
+                "configSlot": slot,
+                "consumedFp": credential_fingerprint(consumed),
+                "fingerprint": credential_fingerprint(renewed),
+            },
+        )
+    except (ClaudeSwitchError, OSError, ValueError) as e:
+        _logger.error(
+            "api: account %s's renewed login could not be stored or set aside: %s; "
+            "log in again if Claude Code asks for it",
+            slot,
+            e,
+        )
+        return
+    _logger.warning(
+        "api: account %s's renewed login was not stored and is set aside (%s)",
+        slot,
+        reason,
+    )
+
+
+def _store_renewal(
+    switcher: ClaudeAccountSwitcher, slot: str, email: str, consumed: str, renewed: str
+) -> None:
+    """Store a renewal of the account's stored login as the consume gate
+    stores one: only while the store still holds the login it renewed, read
+    again now, since adding or removing the account does not wait for
+    claude-swap's lock (a login added meanwhile stays; a removed one is not
+    brought back). Otherwise, and when the write fails, the renewal is set
+    aside. Never raises: the old refresh token is spent, and the renewal is
+    handed out all the same."""
+    now, unreadable = switcher._read_account_credentials_ex(slot, email)
+    if unreadable:
+        reason = _ASIDE_STORE_UNREADABLE
+    elif not now:
+        reason = _ASIDE_SLOT_REMOVED
+    elif credential_fingerprint(now) != credential_fingerprint(consumed):
+        reason = _ASIDE_CAS_CONFLICT
+    else:
+        try:
+            switcher._write_account_credentials(slot, email, renewed)
+        except (ClaudeSwitchError, OSError) as e:
+            _logger.warning(
+                "api: account %s's renewed login could not be kept as its stored "
+                "login: %s",
+                slot,
+                e,
+            )
+            reason = _ASIDE_PERSIST_FAILED
+        else:
+            return
+    _set_aside(switcher, slot, consumed, renewed, reason)
+
+
+def _store_live_renewal(
+    switcher: ClaudeAccountSwitcher, slot: str, email: str, consumed: str, renewed: str
+) -> None:
+    """Store a renewal of the default profile's login wherever the old login
+    was: the account's stored login and the default profile (Claude Code
+    takes it from there at its next request); set it aside when neither
+    takes it. Never raises: the old refresh token is spent, and the new
+    login is handed out all the same."""
+    stored = True
+    try:
+        switcher._write_account_credentials(slot, email, renewed)
+    except (ClaudeSwitchError, OSError) as e:
+        stored = False
+        _logger.warning(
+            "api: account %s's renewed login could not be kept as its stored "
+            "login: %s",
+            slot,
+            e,
+        )
+    try:
+        with claude_config_lock():
+            switcher._write_credentials(renewed)
+    except (ClaudeSwitchError, OSError) as e:
+        _logger.warning(
+            "api: account %s's renewed login could not be written to Claude "
+            "Code's default profile: %s",
+            slot,
+            e,
+        )
+        if not stored:
+            _set_aside(switcher, slot, consumed, renewed, _ASIDE_PERSIST_FAILED)
+
+
+def _write_live(switcher: ClaudeAccountSwitcher, slot: str, credentials: str) -> None:
+    """Put a renewal of the default profile's login that was set aside back
+    where Claude Code reads it; the caller holds Claude Code's credential
+    locks (:func:`_claude_code_locks`). Best effort: it is the stored login
+    now, and claude-swap restores the default profile from there once Claude
+    Code's copy stops working."""
+    try:
+        with claude_config_lock():
+            switcher._write_credentials(credentials)
+    except (ClaudeSwitchError, OSError) as e:
+        _logger.warning(
+            "api: account %s's login that was set aside could not be written to "
+            "Claude Code's default profile: %s",
+            slot,
+            e,
+        )
+
+
+def _attribute_live(
+    switcher: ClaudeAccountSwitcher, slot: str, email: str, org_uuid: str, live: str
+) -> None:
+    """Let claude-swap confirm a login Claude Code renewed in the default
+    profile as the account's own (it asks Anthropic whose the access token
+    is, while that still works), so that it may be handed out and renewed
+    here. Best effort: claude-swap's own check, which never raises and
+    stores the login as the account's when it is."""
+    if _due(live, 0):
+        return
+    stored, unreadable = switcher._read_account_credentials_ex(slot, email)
+    if unreadable or (stored and credential_fingerprint(stored) == credential_fingerprint(live)):
+        return
+    switcher._resync_rotated_backup(slot, email, org_uuid, live)
+
+
+def _confirm_live(
+    switcher: ClaudeAccountSwitcher, slot: str, email: str, org_uuid: str
+) -> None:
+    """When the account is the one Claude Code's default profile is logged
+    in to, run :func:`_attribute_live` on its login there. Before the locks:
+    asking Anthropic is network, which never runs under claude-swap's lock
+    but for a renewal's one request. The check that counts is made under
+    the locks (:func:`_require_own_live`)."""
+    if not switcher._live_identity_matches(email, org_uuid):
+        return
+    active = switcher._read_active_credentials()
+    if not active.value or active.degraded or active.keychain_unavailable:
+        return
+    _attribute_live(switcher, slot, email, org_uuid, active.value)
+
+
+def _renewing_now(slot: str) -> LockError:
+    return LockError(
+        f"Account {slot}'s login is being renewed or switched right now; try "
+        "again in a moment."
+    )
+
+
+@contextlib.contextmanager
+def _account_locks(switcher: ClaudeAccountSwitcher, slot: str) -> Iterator[None]:
+    """Hold, in claude-swap's order, the account's consume lock (every
+    renewal of its login holds it) and claude-swap's own lock (every switch
+    holds it, from reading the login it puts in the default profile to
+    writing it there): no other renewal and no switch comes in between."""
+    consume = FileLock(switcher.consume_lock_file(slot), timeout=ACCESS_TOKEN_LOCK_TIMEOUT)
+    if not consume.acquire():
+        raise _renewing_now(slot)
+    try:
+        own = FileLock(switcher.lock_file, timeout=ACCESS_TOKEN_LOCK_TIMEOUT)
+        if not own.acquire():
+            raise _renewing_now(slot)
+        try:
+            yield
+        finally:
+            own.release()
+    finally:
+        consume.release()
+
+
+@contextlib.contextmanager
+def _claude_code_locks(slot: str) -> Iterator[None]:
+    """Hold Claude Code's credential locks (taken after claude-swap's own, as
+    claude-swap does), so that Claude Code does not renew the default
+    profile's login meanwhile."""
+    with contextlib.ExitStack() as held:
+        try:
+            held.enter_context(claude_credentials_lock())
+        except ClaudeCodeLockTimeout as e:
+            raise _renewing_now(slot) from e
+        except OSError as e:
+            raise LockError(f"Claude Code's credential lock cannot be taken: {e}") from e
+        yield
+
+
+def _require_own_live(
+    switcher: ClaudeAccountSwitcher, slot: str, email: str, live: str
+) -> None:
+    """Refuse a login in the default profile that is not the account's own:
+    its refresh token is neither the stored login's nor one claude-swap
+    confirmed as the account's (:func:`_confirm_live`). Claude Code's store
+    can hold another account's login under this account's name (a partial
+    sync of that store; a ``/login`` between its two writes), and handing it
+    out would put that account's token under this one's name."""
+    lineage = credential_fingerprint(live) or ""
+    stored, unreadable = switcher._read_account_credentials_ex(slot, email)
+    if not unreadable and stored and credential_fingerprint(stored) == lineage:
+        return
+    verdict = switcher._probe_verdicts.get(switcher._lineage_key(slot, email, lineage))
+    if verdict is True:
+        return
+    who = f"Account {slot} ({email})"
+    if verdict is False:
+        raise CredentialError(
+            f"Claude Code's default profile is set to account {slot} ({email}) but "
+            "holds another account's login; log in again there."
+        )
+    if unreadable:
+        raise CredentialReadError(
+            f"{who}'s stored login cannot be read now (the Keychain is locked or "
+            "busy), so its login in Claude Code's default profile cannot be "
+            "checked; unlock it and try again."
+        )
+    if _due(live, 0):
+        raise CredentialError(
+            f"{who}'s login in Claude Code's default profile is not the one "
+            "claude-swap keeps for it, and its access token has lapsed, so "
+            "claude-swap cannot check whose it is. Use Claude Code on this "
+            "computer once (it renews the login there), then try again."
+        )
+    raise CredentialError(
+        f"{who}'s login in Claude Code's default profile is not the one "
+        "claude-swap keeps for it (Claude Code renewed it there, or someone "
+        "logged in) and is not confirmed as this account's yet; try again in a "
+        "few minutes."
+    )
+
+
+def _own_live_login(
+    switcher: ClaudeAccountSwitcher, slot: str, email: str, org_uuid: str
+) -> tuple[str, bool]:
+    """The login of Claude Code's default profile, which runs on the
+    account, once it is known to be the account's own; and whether it is a
+    renewal of that login claude-swap set aside, taken in as the account's
+    stored login but not in the default profile yet. A read that fell back
+    past a failed Keychain read is refused: on macOS Claude Code renews in
+    the Keychain only, so the fallback may be an older login whose access
+    token no longer works. The caller holds :func:`_account_locks`."""
+    active = switcher._read_active_credentials()
+    if active.value is None or active.degraded or active.keychain_unavailable:
+        raise _live_unreadable(slot, email)
+    live = active.value
+    if not live:
+        raise CredentialError(
+            f"Account {slot} ({email}) is the account Claude Code's default "
+            "profile is logged in to, but that profile has no login now; log "
+            "in again there."
+        )
+    refusal = _kind_refusal(slot, email, org_uuid, live)
+    if refusal is not None:
+        raise refusal
+    taken = _take_in_set_aside(switcher, slot, email, live)
+    if taken is not None:
+        return taken, True
+    _require_own_live(switcher, slot, email, live)
+    return live, False
+
+
+def _live_token(
+    switcher: ClaudeAccountSwitcher, slot: str, email: str, org_uuid: str, window_ms: int
+) -> tuple[str, bool]:
+    """The login of Claude Code's default profile, renewed first when it is
+    due, as Claude Code renews it: under Claude Code's credential locks too,
+    read again under them (a renewal Claude Code made meanwhile is taken as
+    it is). A renewal set aside is put back in the default profile under
+    those locks as well. The caller holds :func:`_account_locks`: no switch
+    and no other renewal of claude-swap's comes in between."""
+    live, set_aside = _own_live_login(switcher, slot, email, org_uuid)
+    if not set_aside and not _due(live, window_ms):
+        return live, False
+    with _claude_code_locks(slot):
+        if not set_aside:
+            live, set_aside = _own_live_login(switcher, slot, email, org_uuid)
+        if set_aside:
+            _write_live(switcher, slot, live)
+        if not _due(live, window_ms):
+            return live, False
+        if _session_holds(switcher, slot, email, org_uuid, live):
+            raise _session_renews_it(slot, email)
+        result = oauth.try_refresh_oauth_credentials(
+            live, timeout_s=_LOCKED_RENEWAL_TIMEOUT
+        )
+        if result.error is not None or not result.credentials:
+            raise _renewal_failure(slot, email, result.error)
+        renewed = result.credentials
+        switcher._probe_verdicts[
+            switcher._lineage_key(slot, email, credential_fingerprint(renewed) or "")
+        ] = True
+        _store_live_renewal(switcher, slot, email, live, renewed)
+    return renewed, True
+
+
+def _stored_token(
+    switcher: ClaudeAccountSwitcher, slot: str, email: str, org_uuid: str, window_ms: int
+) -> tuple[str, bool]:
+    """The account's newest stored login, renewed first when it is due. The
+    caller holds :func:`_account_locks`: no other renewal of the login comes
+    in between, and no switch puts the login in the default profile while
+    it is renewed.
+
+    Takes in what claude-swap set aside from a renewal it could not store,
+    and what Claude Code renewed in the account's ``cswap run`` profile once
+    no session runs there (as claude-swap itself does). While a session
+    runs, a newer login in its profile is served as it is."""
+    current, unreadable = switcher._read_account_credentials_ex(slot, email)
+    if unreadable:
+        raise CredentialReadError(
+            f"Account {slot} ({email})'s stored login cannot be read now (the "
+            "Keychain is locked or busy); unlock it and try again."
+        )
+    if current:
+        current = _take_in_set_aside(switcher, slot, email, current) or current
+    if not current:
+        raise CredentialError(f"Account {slot} ({email}) has no stored login.")
+    refusal = _kind_refusal(slot, email, org_uuid, current)
+    if refusal is not None:
+        raise refusal
+    ahead = switcher._session_profile_ahead(slot, email, org_uuid)
+    if ahead is not None and profile_is_quiescent(switcher._session_dir(slot, email)):
+        try:
+            # what claude-swap's own take-in does (_adopt_session_credential),
+            # under the lock held here
+            switcher._store._write_account_credentials(slot, email, ahead)
+        except (ClaudeSwitchError, OSError) as e:
+            raise CredentialWriteError(
+                f"Account {slot} ({email})'s newer login from its `cswap run` "
+                f"profile could not be stored: {e}"
+            ) from e
+        current, ahead = ahead, None
+    login = ahead or current
+    if not _due(login, window_ms):
+        return login, False
+    if ahead is not None or _session_holds(switcher, slot, email, org_uuid, login):
+        raise _session_renews_it(slot, email)
+    result = oauth.try_refresh_oauth_credentials(login, timeout_s=_LOCKED_RENEWAL_TIMEOUT)
+    if result.error is not None or not result.credentials:
+        raise _renewal_failure(slot, email, result.error)
+    _store_renewal(switcher, slot, email, login, result.credentials)
+    return result.credentials, True
+
+
+def _text(value: object) -> str | None:
+    if not isinstance(value, str):
+        return None
+    return value.strip() or None
+
+
+def _instant(epoch_ms: int) -> str:
+    """Epoch milliseconds as ISO 8601 UTC with milliseconds."""
+    moment = _EPOCH + timedelta(milliseconds=epoch_ms)
+    return moment.isoformat(timespec="milliseconds").replace("+00:00", "Z")
+
+
+def _token_info(
+    slot: str,
+    email: str,
+    org_uuid: str,
+    record: Mapping[str, Any],
+    login: str,
+    renewed: bool,
+) -> AccessTokenInfo:
+    entry = _oauth_entry(login) or {}
+    token = entry.get("accessToken")
+    expires = entry.get("expiresAt")
+    if (
+        not isinstance(token, str)
+        or not token.strip()
+        or isinstance(expires, bool)
+        or not isinstance(expires, (int, float))
+        or not math.isfinite(expires)
+    ):
+        raise CredentialError(
+            f"Account {slot} ({email})'s login has no access token with an expiry; "
+            "log in again."
+        )
+    scopes = _login_scopes(entry)
+    if scopes is None:
+        raise _no_scopes(slot, email)
+    return AccessTokenInfo(
+        slot=slot,
+        email=email,
+        organization_uuid=org_uuid or None,
+        organization=_text(record.get("organizationName")),
+        account_uuid=_text(record.get("uuid")),
+        access_token=token.strip(),
+        expires_at=_instant(int(expires)),
+        scopes=scopes,
+        subscription_type=_text(entry.get("subscriptionType")),
+        rate_limit_tier=_text(entry.get("rateLimitTier")),
+        renewed=renewed,
+    )
+
+
+def access_token(
+    switcher: ClaudeAccountSwitcher, identifier: str, *, renew_within: float = 0.0
+) -> AccessTokenInfo:
+    """The newest access token of an account on this computer, for another
+    computer to use without the login (sak.12): its refresh token never
+    leaves, so only this computer ever renews the login.
+
+    The newest login is the default profile's live login when the account
+    is the one Claude Code's default profile is logged in to, handed out
+    only when it is the account's own (the stored login's refresh token, or
+    one claude-swap confirmed by asking Anthropic whose it is); otherwise the
+    stored login, after taking in a newer one (a renewal claude-swap set
+    aside; one Claude Code made in the account's ``cswap run`` profile).
+
+    The login is read, and renewed, under the account's consume lock and
+    claude-swap's own lock (the one a switch holds), so no other renewal of
+    it and no switch comes in between. When the access token lapses within
+    ``renew_within`` seconds (or has lapsed), the login is renewed first,
+    the way claude-swap and Claude Code renew it here, so no copy on this
+    computer is left with a spent refresh token: the default profile's login
+    under Claude Code's own credential locks as well, written back to the
+    default profile and the stored login; a stored login written back to
+    the store while it still holds the login renewed, as claude-swap's
+    consume gate writes one (a login added or removed meanwhile is left as
+    it is). A renewal that is not stored is set aside, and the next call
+    takes it in. A login renewed meanwhile is taken as it is. A login
+    is not renewed while a Claude session runs on it in the account's
+    ``cswap run`` profile (that session holds the same refresh token and
+    renews it itself the next time it is used); a session on another login
+    of the account does not hold this one.
+
+    Raises :class:`AccountNotFoundError` for an unknown account,
+    :class:`ConfigError` for an ambiguous email, a foreign
+    ``CLAUDE_CONFIG_DIR``, or ``CLAUDE_SECURESTORAGE_CONFIG_DIR`` set (Claude
+    Code then keeps its login where claude-swap does not look),
+    :class:`ValidationError` for a bad ``renew_within``, an API-key or a
+    setup-token account, or a login without scopes (another computer could
+    not use it), :class:`CredentialError` when there is no login (``has no
+    stored login``; the default profile ``has no login now``), it no longer
+    works or cannot be renewed now, or the default profile's login is not
+    the account's or cannot be confirmed as the account's yet,
+    :class:`CredentialReadError` when it cannot be read now,
+    :class:`LockError` while another renewal or a switch does not end within
+    :data:`ACCESS_TOKEN_LOCK_TIMEOUT` seconds, and :class:`SessionError`
+    while a Claude session holds a login that is due. Never prompts; the
+    token is never printed or logged.
+    """
+    _refuse_foreign_profile()
+    window_ms = _renew_window(renew_within)
+    if os.environ.get("CLAUDE_SECURESTORAGE_CONFIG_DIR"):
+        raise ConfigError(_UNMIRRORED)
+    with _quiet():
+        slot, email, org_uuid = switcher.resolve_account(identifier)
+        record = (switcher._get_sequence_data() or {}).get("accounts", {}).get(slot, {})
+    _confirm_live(switcher, slot, email, org_uuid)
+    # The rest runs under the account's locks and outside the output lock:
+    # it waits for locks and the network, and every other call of this
+    # module waits for that lock.
+    with _account_locks(switcher, slot):
+        if switcher._live_identity_matches(email, org_uuid):
+            login, renewed = _live_token(switcher, slot, email, org_uuid, window_ms)
+        else:
+            login, renewed = _stored_token(switcher, slot, email, org_uuid, window_ms)
+    return _token_info(slot, email, org_uuid, record, login, renewed)
+
+
+# -- a profile that runs on an access token only (sak.12) ---------------------------
+
+
+def _access_profile(config_dir: str | os.PathLike[str]) -> str:
+    """The profile folder of a kept access token, as the exact string Claude
+    Code runs with (``CLAUDE_CONFIG_DIR``); refuses a place that is not a
+    folder of its own, by whatever spelling (:func:`_inside`), before
+    anything is written."""
+    raw = os.fspath(config_dir)
+    if not isinstance(raw, str) or not raw.strip():
+        raise ConfigError("Name the profile folder.")
+    if not os.path.isabs(raw):
+        raise ConfigError(f"Name the profile folder by its full path, not {raw}.")
+    path = Path(raw)
+    for root, what in (
+        (get_default_claude_config_home(), "Claude Code's default profile"),
+        (get_backup_root(), "claude-swap's own store"),
+        (get_legacy_backup_root(), "claude-swap's own store"),
+    ):
+        if _inside(path, root) or _inside(root, path):
+            raise ConfigError(
+                f"{raw} is {what}, or inside or above it; name a folder of its own."
+            )
+    if path.exists() and not path.is_dir():
+        raise ConfigError(f"{raw} is not a folder.")
+    return raw
+
+
+_REFRESH_TOKEN_PREFIX = "sk-ant-ort"
+"""How Anthropic's refresh tokens start (``sk-ant-ort01-...``)."""
+
+
+def _checked_token(access_token: object) -> str:
+    if (
+        not isinstance(access_token, str)
+        or not access_token
+        or not access_token.isprintable()
+        or any(c.isspace() for c in access_token)
+    ):
+        raise ValidationError("The access token is empty or not one token.")
+    if looks_like_api_key(access_token):
+        raise ValidationError("This is an API key, not an access token.")
+    if access_token.startswith(_REFRESH_TOKEN_PREFIX):
+        raise ValidationError(
+            "This is a refresh token, not an access token; a refresh token never "
+            "goes to another computer."
+        )
+    return access_token
+
+
+def _epoch_ms(expires_at: object) -> int:
+    moment: datetime | None = None
+    if isinstance(expires_at, str):
+        try:
+            moment = datetime.fromisoformat(expires_at)
+        except ValueError:
+            moment = None
+    if moment is None or moment.tzinfo is None:
+        raise ValidationError(
+            "expires_at is an ISO 8601 time with its zone "
+            f"(2026-10-16T21:47:00Z); not {expires_at!r}."
+        )
+    return (moment - _EPOCH) // timedelta(milliseconds=1)
+
+
+def _checked_scopes(scopes: object) -> list[str]:
+    if isinstance(scopes, str) or not isinstance(scopes, Sequence):
+        raise ValidationError("scopes is a list of the login's scopes.")
+    kept = list(scopes)
+    if not kept or not all(
+        isinstance(s, str) and s and not any(c.isspace() for c in s) for s in kept
+    ):
+        raise ValidationError(
+            "scopes lists the login's scopes (user:inference, ...): Claude Code "
+            "reads them to know what the login may do."
+        )
+    return kept
+
+
+def _checked_identity(value: object, what: str, *, required: bool = False) -> str | None:
+    if value is None and not required:
+        return None
+    if not isinstance(value, str):
+        raise ValidationError(f"{what} is text{'' if required else ' or None'}.")
+    if required and not value.strip():
+        raise ValidationError(f"{what} is empty.")
+    return value.strip() or None
+
+
+@contextlib.contextmanager
+def _profile_lock(
+    lock_dir: Path, staleness: float, what: str
+) -> Iterator[None]:
+    """Hold one of Claude Code's locks of a profile (proper-lockfile)."""
+    with contextlib.ExitStack() as held:
+        try:
+            held.enter_context(proper_lockfile(lock_dir, staleness=staleness))
+        except ClaudeCodeLockTimeout as e:
+            raise LockError(
+                f"Claude Code is changing {what} right now; try again in a moment."
+            ) from e
+        except OSError as e:
+            raise CredentialWriteError(
+                f"Claude Code's lock of {what} cannot be taken: {e}"
+            ) from e
+        yield
+
+
+def _profile_item(raw: str) -> str | None:
+    """The profile's own Keychain item (macOS), which Claude Code reads
+    before its ``.credentials.json``; ``None`` when there is none."""
+    if Platform.detect() != Platform.MACOS:
+        return None
+    try:
+        return macos_keychain.get_password(
+            keychain_service_name(raw), macos_keychain.keychain_account_name()
+        )
+    except macos_keychain.KEYCHAIN_ERRORS as e:
+        raise CredentialReadError(
+            f"The Keychain item of the profile {raw} cannot be read now (locked or "
+            f"busy); unlock the keychain and retry: {e}"
+        ) from e
+
+
+def _profile_file(path: Path) -> str:
+    try:
+        return path.read_text(encoding="utf-8")
+    except FileNotFoundError:
+        return ""
+    except (OSError, ValueError) as e:
+        raise CredentialReadError(f"Cannot read {path}: {e}") from e
+
+
+def _refuse_full_login(raw: str, current: str) -> None:
+    """A login with a refresh token was not put there by
+    :func:`keep_access_login` (someone logged in there): it is never
+    replaced or removed, which would lose it."""
+    entry = _oauth_entry(current) or {}
+    refresh = entry.get("refreshToken")
+    if isinstance(refresh, str) and refresh.strip():
+        raise ConfigError(
+            f"The profile {raw} holds a login of its own (someone logged in there), "
+            "so it is left as it is; log out there or use another folder."
+        )
+
+
+def _profile_keys(current: str) -> dict[str, Any]:
+    """What Claude Code keeps in the profile's credentials besides the login
+    (an MCP server's login, a plugin's secrets)."""
+    try:
+        data = json.loads(current) if current.strip() else {}
+    except ValueError:
+        data = {}
+    if not isinstance(data, dict):
+        return {}
+    return {key: value for key, value in data.items() if key != "claudeAiOauth"}
+
+
+_TEMPORARY_SUFFIX = ".tmp"
+
+
+def _temporary_prefix(path: Path) -> str:
+    """How :func:`_write_private` names its temporary copy of ``path``."""
+    return f".{path.name}."
+
+
+def _sweep_temporaries(path: Path) -> None:
+    """Remove the temporary copies of ``path`` that a write left behind when
+    its process died before it could (each holds the token). The caller
+    holds the lock that writes of ``path`` are made under."""
+    prefix = _temporary_prefix(path)
+    try:
+        names = os.listdir(path.parent)
+    except OSError as e:
+        _logger.debug("api: could not look for leftovers in %s: %s", path.parent, e)
+        return
+    for name in names:
+        if (
+            name.startswith(prefix)
+            and name.endswith(_TEMPORARY_SUFFIX)
+            and len(name) > len(prefix) + len(_TEMPORARY_SUFFIX)
+        ):
+            try:
+                os.unlink(path.parent / name)
+            except OSError as e:
+                _logger.debug("api: could not remove %s: %s", path.parent / name, e)
+
+
+def _write_private(path: Path, text: str) -> None:
+    """Replace ``path`` with ``text`` in one step, readable by its owner only,
+    on the disk (its folder's entry too) before this returns. The temporary
+    copy never outlives the call; one a dead process left behind goes with
+    :func:`_sweep_temporaries`."""
+    temporary: str | None = None
+    try:
+        fd, temporary = tempfile.mkstemp(
+            dir=path.parent, prefix=_temporary_prefix(path), suffix=_TEMPORARY_SUFFIX
+        )
+        with os.fdopen(fd, "w", encoding="utf-8") as f:
+            f.write(text)
+            f.flush()
+            sync_file(f.fileno())
+        replace_with_retry(temporary, path)
+        temporary = None
+        sync_folder(path.parent)
+    except OSError as e:
+        raise CredentialWriteError(f"Could not write {path}: {e}") from e
+    finally:
+        if temporary is not None:
+            with contextlib.suppress(OSError):
+                os.unlink(temporary)
+
+
+def _remove_profile_item(raw: str) -> None:
+    try:
+        macos_keychain.delete_password(
+            keychain_service_name(raw), macos_keychain.keychain_account_name()
+        )
+    except macos_keychain.KEYCHAIN_ERRORS as e:
+        raise CredentialWriteError(
+            f"Could not remove the Keychain item of the profile {raw}, which would "
+            f"keep Claude Code from reading the new login: {e}"
+        ) from e
+
+
+def _touch_newer(path: Path) -> None:
+    """Give the file a newer modification time: a running Claude Code checks
+    it before each request and reads its login again when it moved."""
+    try:
+        status = path.stat()
+        newer = max(time.time_ns(), status.st_mtime_ns + 1_000_000)
+        os.utime(path, ns=(status.st_atime_ns, newer))
+    except OSError:
+        _logger.debug("api: could not touch %s", path, exc_info=True)
+
+
+def _keep_access(raw: str, entry: Mapping[str, Any]) -> None:
+    """Make ``entry`` the profile's login, where Claude Code reads it: its
+    ``.credentials.json``, with the profile's Keychain item removed (macOS),
+    which would hide the file. Under Claude Code's own lock for the
+    profile's stored credentials; what else Claude Code keeps there (an MCP
+    server's login, also when it moved it into the Keychain item) stays."""
+    path = Path(raw)
+    target = path / ".credentials.json"
+    with _profile_lock(
+        storage_write_lock_dir(path), STORAGE_WRITE_STALENESS_S, f"the login of {raw}"
+    ):
+        item = _profile_item(raw)
+        current = item if item is not None else _profile_file(target)
+        _refuse_full_login(raw, current)
+        kept = _profile_keys(current)
+        kept["claudeAiOauth"] = dict(entry)
+        _sweep_temporaries(target)
+        _write_private(target, json.dumps(kept))
+        if item is not None:
+            _remove_profile_item(raw)
+            _touch_newer(target)
+
+
+def _default_theme() -> str:
+    """The default profile's theme, so the new profile looks the same."""
+    try:
+        data = json.loads(get_default_global_config_path().read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return "dark"
+    theme = data.get("theme") if isinstance(data, dict) else None
+    return theme if isinstance(theme, str) and theme else "dark"
+
+
+def _keep_identity(directory: Path, account: Mapping[str, str | None]) -> None:
+    """Record whose login the profile holds in its ``.claude.json``
+    (``oauthAccount``, as Claude Code does), under Claude Code's lock for
+    that file; what Claude Code recorded about the same account stays."""
+    config_path = directory / ".claude.json"
+    given = {key: value for key, value in account.items() if value is not None}
+    with _profile_lock(
+        directory / ".claude.json.lock", CONFIG_STALENESS_S, str(config_path)
+    ):
+        if config_path.is_symlink() or (config_path.exists() and not config_path.is_file()):
+            raise ConfigError(f"{config_path} is not a file of the profile's own.")
+        existing: dict[str, Any] = {}
+        try:
+            loaded = json.loads(config_path.read_text(encoding="utf-8"))
+        except FileNotFoundError:
+            loaded = {}
+        except (OSError, ValueError):
+            loaded = {}  # a broken file is replaced, as a session profile's is
+        if isinstance(loaded, dict):
+            existing = loaded
+        current = existing.get("oauthAccount")
+        same = (
+            isinstance(current, dict)
+            and current.get("emailAddress") == given.get("emailAddress")
+            and (current.get("organizationUuid") or None)
+            == given.get("organizationUuid")
+        )
+        merged = {**current, **given} if same and isinstance(current, dict) else given
+        if (
+            existing.get("oauthAccount") == merged
+            and existing.get("hasCompletedOnboarding") is True
+            and existing.get("theme")
+        ):
+            return
+        existing["oauthAccount"] = merged
+        existing["hasCompletedOnboarding"] = True
+        if not existing.get("theme"):
+            existing["theme"] = _default_theme()
+        try:
+            atomic_write_json(config_path, existing)
+        except OSError as e:
+            raise ConfigError(f"Could not write {config_path}: {e}") from e
+
+
+class _SharingHost:
+    """What :class:`SessionManager`'s sharing reads of a switcher, for a
+    profile that is no claude-swap account: no account store is opened."""
+
+    def __init__(self) -> None:
+        self.platform = Platform.detect()
+        self.backup_dir = get_backup_root()
+        self._logger = _logger
+
+
+def keep_access_login(
+    config_dir: str | os.PathLike[str],
+    *,
+    access_token: str,
+    expires_at: str,
+    scopes: Sequence[str],
+    subscription_type: str | None,
+    rate_limit_tier: str | None,
+    email: str,
+    organization_uuid: str | None,
+    organization: str | None,
+    account_uuid: str | None,
+    share_history: bool = True,
+) -> None:
+    """Make ``config_dir`` a Claude Code profile signed in with an access
+    token alone (sak.12): another computer's :func:`access_token`, with no
+    refresh token, so Claude Code here uses it and never renews it (a new
+    one comes from that computer). The token it had is replaced; a running
+    Claude Code takes the new one at its next request.
+
+    ``config_dir`` is the exact string Claude Code runs with
+    (``CLAUDE_CONFIG_DIR``), a full path; the folder is made when it is
+    missing. The login goes into its ``.credentials.json`` (``refreshToken``
+    null, 0600, replaced in one step), under Claude Code's own lock for the
+    profile's stored credentials; on macOS the profile's Keychain item is
+    removed, since Claude Code reads it first (what Claude Code keeps there
+    besides a login, such as an MCP server's login, moves to the file). The
+    account goes into its ``.claude.json`` (``oauthAccount``), and the
+    profile shares settings, MCP servers and, with ``share_history``,
+    conversation history with the default profile, as ``cswap run``
+    profiles do. It is no claude-swap account and is never registered.
+
+    ``expires_at`` is ISO 8601 with its zone, as :func:`access_token` gives
+    it. Refuses Claude Code's default profile and claude-swap's own store
+    (and anything inside or above them, by whatever spelling: letter case,
+    macOS's ``/System/Volumes/Data``, a symlink, ``..``) with
+    :class:`ConfigError` before anything is written, and a profile that
+    holds a login of its own (with a refresh token: someone logged in there)
+    the same way; :class:`ValidationError` for a value that is not what it
+    should be (an API key or a refresh token, an empty token, a time without
+    a zone, no scopes); :class:`SessionError` for ``share_history`` on Windows;
+    :class:`CredentialReadError` when the Keychain item cannot be read now;
+    :class:`CredentialWriteError` when the login cannot be written, or the
+    item cannot be removed; :class:`LockError` while Claude Code holds its
+    lock. Never prompts; the token is never printed or logged.
+    """
+    raw = _access_profile(config_dir)
+    entry = {
+        "accessToken": _checked_token(access_token),
+        "refreshToken": None,
+        "expiresAt": _epoch_ms(expires_at),
+        "scopes": _checked_scopes(scopes),
+        "subscriptionType": _checked_identity(subscription_type, "subscription_type"),
+        "rateLimitTier": _checked_identity(rate_limit_tier, "rate_limit_tier"),
+    }
+    account = {
+        "accountUuid": _checked_identity(account_uuid, "account_uuid"),
+        "emailAddress": _checked_identity(email, "email", required=True),
+        "organizationUuid": _checked_identity(organization_uuid, "organization_uuid"),
+        "organizationName": _checked_identity(organization, "organization"),
+    }
+    if share_history and Platform.detect() == Platform.WINDOWS:
+        raise SessionError("share_history is not supported on Windows")
+    path = Path(raw)
+    try:
+        path.mkdir(mode=0o700, parents=True, exist_ok=True)
+    except OSError as e:
+        raise ConfigError(f"Could not make the profile folder {raw}: {e}") from e
+    _keep_access(raw, entry)
+    _keep_identity(path, account)
+    with _quiet():
+        sharing = SessionManager(cast(ClaudeAccountSwitcher, _SharingHost()))
+        sharing._sync_sharing(path, True, share_history)
+
+
+def forget_access_login(config_dir: str | os.PathLike[str]) -> None:
+    """Remove the access token :func:`keep_access_login` kept in
+    ``config_dir`` (sak.12), under Claude Code's own lock for the profile's
+    stored credentials: the login leaves its ``.credentials.json`` and, on
+    macOS, the profile's Keychain item is removed, as
+    :func:`forget_profile_login` does. What Claude Code keeps there besides
+    a login (an MCP server's login, also when it moved it into the Keychain
+    item) stays in the file, as :func:`keep_access_login` keeps it; the file
+    goes when nothing else is left. The folder and the rest of the profile
+    stay; a missing folder is fine.
+
+    Refuses the places :func:`keep_access_login` refuses and a profile that
+    holds a login of its own (someone logged in there) with
+    :class:`ConfigError`; raises :class:`CredentialReadError` when the
+    Keychain item cannot be read now, :class:`CredentialError` when the
+    login stays, and :class:`LockError` while Claude Code holds its lock.
+    """
+    raw = _access_profile(config_dir)
+    path = Path(raw)
+    if not path.is_dir():
+        return
+    target = path / ".credentials.json"
+    with _profile_lock(
+        storage_write_lock_dir(path), STORAGE_WRITE_STALENESS_S, f"the login of {raw}"
+    ):
+        item = _profile_item(raw)
+        current = item if item is not None else _profile_file(target)
+        _refuse_full_login(raw, current)
+        _sweep_temporaries(target)
+        kept = _profile_keys(current)
+        if not kept:
+            forget_config_dir_login(raw)
+            return
+        _write_private(target, json.dumps(kept))
+        if item is not None:
+            _remove_profile_item(raw)
+            _touch_newer(target)
