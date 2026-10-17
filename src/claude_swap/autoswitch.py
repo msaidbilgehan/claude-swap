@@ -1056,11 +1056,17 @@ class AutoSwitchEngine:
             )
             if self.switcher.has_live_login():
                 # Live login exists but cswap doesn't manage it: never act —
-                # a switch would overwrite it without a backup.
+                # a switch would overwrite it without a backup. A login another
+                # computer lent (sak.13) is left alone too; it cannot be added.
                 self._emit(
                     NoSwitchEvent(
                         reason="unmanaged-active-account",
-                        detail="run 'cswap --add-account' to include it in rotation",
+                        detail=(
+                            "Claude Code's default login is access another "
+                            "computer lent; it is left as it is"
+                            if self.switcher._live_login_is_lent()
+                            else "run 'cswap --add-account' to include it in rotation"
+                        ),
                     )
                 )
             else:

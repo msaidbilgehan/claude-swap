@@ -26,7 +26,7 @@ from claude_swap.fsutil import replace_with_retry
 from claude_swap.json_output import SCHEMA_VERSION as JSON_SCHEMA_VERSION
 from claude_swap.json_output import usage_from_json
 from claude_swap.models import Platform, get_timestamp, normalize_alias
-from claude_swap.oauth import credential_fingerprint
+from claude_swap.oauth import credential_fingerprint, is_lent_login
 
 if TYPE_CHECKING:
     from claude_swap.switcher import ClaudeAccountSwitcher
@@ -204,8 +204,10 @@ def export_accounts(
     else:
         target_nums = sorted(accounts_map.keys(), key=int)
 
-    # Identify the live active account (live vault has fresher tokens than backup)
-    current_identity = switcher._get_current_account()
+    # Identify the live active account (live vault has fresher tokens than
+    # backup). A live login another computer lent (sak.13) is not that
+    # account's login here: its stored login is exported instead.
+    current_identity = switcher._own_live_identity()
 
     accounts_payload: list[dict[str, Any]] = []
     for num in target_nums:
@@ -218,9 +220,12 @@ def export_accounts(
             and current_identity[0] == email
             and current_identity[1] == org_uuid
         )
+        live_text = switcher._read_credentials() if is_active else None
+        if is_lent_login(live_text):
+            is_active = False  # lent after all (sak.13): the stored login goes
 
         if is_active:
-            creds_text = switcher._read_credentials()
+            creds_text = live_text
             if not creds_text:
                 raise CredentialReadError(
                     f"failed to read live credentials for active account {email}"
@@ -401,6 +406,15 @@ def import_accounts(
                     f"credentials for {email} must be a JSON object"
                 )
             creds_text = json.dumps(creds_obj)
+            if is_lent_login(creds_text):
+                # sak.13: an access token another computer lent has no
+                # refresh token; stored here it would stop working for good.
+                raise TransferError(
+                    f"the credentials for {email} are an access token alone "
+                    "(lent by another computer, no refresh token), which this "
+                    "computer could not renew; export the account from the "
+                    "computer that holds its login"
+                )
         key = (email, org_uuid)
         if key in seen_keys:
             raise TransferError(
@@ -638,7 +652,7 @@ def import_accounts(
     # live login, a plain switch would back the (possibly stale) live
     # credentials up over it (issue #79) — point at the explicit activation
     # path instead.
-    identity = switcher._get_current_account()
+    identity = switcher._own_live_identity()
     if identity is not None and final is not None:
         live_slot = switcher._find_account_slot(final, identity[0], identity[1])
         if live_slot is not None and live_slot in written_slots:

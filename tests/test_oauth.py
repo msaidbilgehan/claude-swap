@@ -1529,3 +1529,77 @@ class TestLoginExpiresAtIso:
     ])
     def test_anything_but_a_positive_epoch_is_unknown(self, creds):
         assert oauth.login_expires_at_iso(creds) is None
+
+
+def _lent(**changes) -> str:
+    """A login as claude-SAK's token sync keeps it (``keep_access_login``)."""
+    entry = {
+        "accessToken": "sk-ant-oat01-lent",
+        "refreshToken": None,
+        "expiresAt": 1_792_187_232_345,
+        "scopes": ["user:profile", "user:inference"],
+        "subscriptionType": "max",
+        "rateLimitTier": "default_claude_max_20x",
+    }
+    entry.update(changes)
+    return json.dumps({"claudeAiOauth": {k: v for k, v in entry.items() if v != ...}})
+
+
+class TestAccessOnlyLogins:
+    """sak.13: a login on an access token alone, and the one another
+    computer lent with claude-SAK's token sync."""
+
+    def test_a_lent_login_is_both(self):
+        assert oauth.is_access_only_login(_lent())
+        assert oauth.is_lent_login(_lent())
+        assert oauth.is_lent_login(json.dumps({
+            **json.loads(_lent()), "mcpOAuth": {"server": {}},
+        }))
+
+    @pytest.mark.parametrize("changes", [
+        {"refreshToken": ...},
+        {"refreshToken": ""},
+        {"refreshToken": "  "},
+        {"scopes": ...},
+        {"scopes": []},
+        {"scopes": ["user:profile", ""]},
+    ])
+    def test_access_only_but_not_how_token_sync_lends_it(self, changes):
+        creds = _lent(**changes)
+        assert oauth.is_access_only_login(creds)
+        assert not oauth.is_lent_login(creds)
+
+    @pytest.mark.parametrize("creds", [
+        None,
+        "",
+        "   ",
+        "{}",
+        "not json",
+        "sk-ant-api03-key",
+        json.dumps({"mcpOAuth": {}}),
+        json.dumps({"claudeAiOauth": None}),
+        _lent(refreshToken="sk-ant-ort01-rt"),
+        _lent(accessToken=""),
+        _lent(accessToken=None),
+        # setup-tokens, as claude-swap stored them over time: never one
+        json.dumps({"claudeAiOauth": {"accessToken": "sk-ant-oat01-t"}}),
+        json.dumps({"claudeAiOauth": {
+            "accessToken": "sk-ant-oat01-t",
+            "scopes": ["user:inference", "user:profile"],
+        }}),
+        json.dumps({"claudeAiOauth": {
+            "accessToken": "sk-ant-oat01-t", "scopes": ["user:inference"],
+        }}),
+        json.dumps({"claudeAiOauth": {
+            "accessToken": "sk-ant-oat01-t", "refreshToken": None,
+            "expiresAt": None, "scopes": ["user:inference"],
+        }}),
+        _lent(scopes=["user:inference"]),
+        _lent(expiresAt=...),
+        _lent(expiresAt=None),
+        _lent(expiresAt="2026-10-16"),
+        _lent(expiresAt=True),
+    ])
+    def test_neither(self, creds):
+        assert not oauth.is_access_only_login(creds)
+        assert not oauth.is_lent_login(creds)

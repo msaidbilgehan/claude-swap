@@ -42,6 +42,7 @@ EXPECTED_ALL = [
     "ConfigWarningEvent",
     "CopiedLogin",
     "CredentialError",
+    "DefaultLoginInfo",
     "ErrorEvent",
     "HandedOver",
     "LockError",
@@ -49,6 +50,7 @@ EXPECTED_ALL = [
     "LoginSource",
     "MovedLogin",
     "NoSwitchEvent",
+    "OwnLoginError",
     "PollEvent",
     "ProjectAccount",
     "ProjectMapping",
@@ -70,7 +72,9 @@ EXPECTED_ALL = [
     "add_setup_token",
     "check_login_source",
     "create_engine",
+    "default_login",
     "forget_access_login",
+    "forget_default_access_login",
     "forget_profile_login",
     "hand_over_login",
     "import_login",
@@ -89,6 +93,7 @@ EXPECTED_ALL = [
     "shared_grants",
     "switch_to",
     "unmap_project",
+    "use_access_login",
     "version",
 ]
 
@@ -197,6 +202,9 @@ EXPECTED_SIGNATURES = {
         "share_history: 'bool' = True) -> 'None'"
     ),
     "forget_access_login": "(config_dir: 'str | os.PathLike[str]') -> 'None'",
+    "default_login": "() -> 'DefaultLoginInfo'",
+    "use_access_login": "(config_dir: 'str | os.PathLike[str]') -> 'bool'",
+    "forget_default_access_login": "() -> 'bool'",
 }
 
 ACCOUNT_ROW_KEYS = {
@@ -3612,3 +3620,1142 @@ class TestForgetAccessLogin:
         monkeypatch.setattr(macos_keychain, "delete_password", locked)
         with pytest.raises(api.CredentialError, match="keychain"):
             api.forget_access_login(profile)
+
+
+# -- Claude Code's default login on a device (sak.13) -------------------------------
+
+
+@pytest.fixture
+def linux(monkeypatch):
+    """Claude Code's stores off macOS: the default profile's file only."""
+    from claude_swap import session
+
+    monkeypatch.setattr(
+        session.Platform, "detect", classmethod(lambda _cls: Platform.LINUX)
+    )
+
+
+@pytest.fixture
+def kept(temp_home, no_stdin, tmp_path) -> Path:
+    """A profile token sync keeps account b signed in with (sak.12)."""
+    profile = tmp_path / "synced" / "b"
+    api.keep_access_login(profile, **_KEPT)
+    return profile
+
+
+def _default_item() -> tuple[str, str]:
+    """Claude Code's Keychain item of the default profile."""
+    from claude_swap import macos_keychain
+
+    return "Claude Code-credentials", macos_keychain.keychain_account_name()
+
+
+def _managed_item() -> tuple[str, str]:
+    """Claude Code's Keychain item of a managed API key."""
+    from claude_swap import macos_keychain
+
+    return "Claude Code", macos_keychain.keychain_account_name()
+
+
+def _default_file(home: Path) -> Path:
+    return home / ".claude" / ".credentials.json"
+
+
+def _home_config(home: Path) -> dict:
+    return json.loads((home / ".claude.json").read_text())
+
+
+_KEPT_ACCOUNT = {
+    "accountUuid": "uuid-2",
+    "emailAddress": "b@example.com",
+    "organizationUuid": "org-2",
+    "organizationName": "Team",
+}
+
+
+def _everything(temp_home: Path, keychain) -> tuple:
+    """What the default profile holds, to show nothing changed."""
+    files = tuple(
+        path.read_text() if path.exists() else None
+        for path in (_default_file(temp_home), temp_home / ".claude.json")
+    )
+    return dict(keychain.data) if keychain is not None else None, files
+
+
+class TestDefaultLogin:
+    """What Claude Code's default profile is signed in with (sak.13)."""
+
+    def test_nothing_there_is_none(self, temp_home, no_stdin, macos, capfd):
+        capfd.readouterr()
+        assert api.default_login() == api.DefaultLoginInfo(
+            kind="none", email=None, organization_uuid=None, expires_at=None
+        )
+        _assert_silent(capfd)
+
+    @pytest.mark.parametrize(
+        "held",
+        [
+            "",  # worker-1: the item is there and empty
+            "  \n",
+            "{}",
+            "null",
+            "not json",
+            json.dumps({"mcpOAuth": {"server": {"accessToken": "mcp"}}}),
+            json.dumps({"claudeAiOauth": {"accessToken": "", "refreshToken": ""}}),
+        ],
+    )
+    def test_a_keychain_item_without_a_login_is_none(
+        self, temp_home, no_stdin, macos, held
+    ):
+        macos.set_password(*_default_item(), held)
+        (temp_home / ".claude.json").write_text(json.dumps({"theme": "dark"}))
+        assert api.default_login().kind == "none"
+
+    @pytest.mark.parametrize("held", ["", "{}", json.dumps({"mcpOAuth": {}})])
+    def test_a_file_without_a_login_is_none(self, temp_home, no_stdin, linux, held):
+        _default_file(temp_home).write_text(held)
+        assert api.default_login().kind == "none"
+
+    def test_the_kept_login_reads_as_access_with_its_account(self, kept, macos):
+        api.use_access_login(kept)
+        assert api.default_login() == api.DefaultLoginInfo(
+            kind="access",
+            email="b@example.com",
+            organization_uuid="org-2",
+            expires_at="2026-10-16T21:47:12.345Z",
+        )
+
+    @pytest.mark.parametrize("refresh", [None, "", "missing"])
+    def test_an_access_token_alone_reads_as_access(
+        self, temp_home, no_stdin, linux, refresh
+    ):
+        login = _token_login("sk-ant-oat01-a", refresh, 1_900_000_000_000)
+        if refresh == "missing":
+            del login["claudeAiOauth"]["refreshToken"]
+        _default_file(temp_home).write_text(json.dumps(login))
+        info = api.default_login()
+        assert info.kind == "access"
+        assert info.expires_at == "2030-03-17T17:46:40.000Z"
+        assert info.email is None  # ~/.claude.json records no account
+
+    def test_a_login_of_its_own_reads_as_own(self, temp_home, no_stdin, linux):
+        own = _token_login(
+            "sk-ant-oat01-own", "rt-own", _in(hours=8),
+            refreshTokenExpiresAt=1_900_000_000_000,
+        )
+        _default_file(temp_home).write_text(json.dumps(own))
+        (temp_home / ".claude.json").write_text(json.dumps({
+            "oauthAccount": {"emailAddress": "me@example.com", "organizationUuid": "o"},
+        }))
+        assert api.default_login() == api.DefaultLoginInfo(
+            kind="own",
+            email="me@example.com",
+            organization_uuid="o",
+            expires_at="2030-03-17T17:46:40Z",
+        )
+
+    @pytest.mark.parametrize(
+        "token",
+        [
+            {"accessToken": "sk-ant-oat01-t", "scopes": ["user:inference"]},
+            {"accessToken": "sk-ant-oat01-t", "scopes": _SCOPES},
+            {"accessToken": "sk-ant-oat01-t"},
+            {
+                "accessToken": "sk-ant-oat01-t", "refreshToken": None,
+                "expiresAt": None, "scopes": ["user:inference"],
+            },
+        ],
+    )
+    def test_a_setup_token_reads_as_own(self, temp_home, no_stdin, linux, token):
+        """Every shape claude-swap ever stored a setup-token in: one of its
+        own accounts is active."""
+        _default_file(temp_home).write_text(json.dumps({"claudeAiOauth": token}))
+        assert api.default_login().kind == "own"
+
+    def test_a_login_of_its_own_behind_the_item_reads_as_own(
+        self, temp_home, no_stdin, macos
+    ):
+        macos.set_password(
+            *_default_item(), json.dumps(_token_login("sk-lent", None, _in(hours=1)))
+        )
+        _default_file(temp_home).write_text(
+            json.dumps(_token_login("sk-own", "rt-own", _in(hours=1)))
+        )
+        assert api.default_login().kind == "own"
+
+    def test_the_item_comes_before_the_file(self, temp_home, no_stdin, macos):
+        macos.set_password(
+            *_default_item(), json.dumps(_token_login("sk-a", None, 1_900_000_000_000))
+        )
+        _default_file(temp_home).write_text(json.dumps(_token_login("sk-b", None, 1)))
+        assert api.default_login().expires_at == "2030-03-17T17:46:40.000Z"
+        macos.set_password(*_default_item(), "")  # an empty item hides nothing
+        assert api.default_login().expires_at == "1970-01-01T00:00:00.001Z"
+
+    def test_an_api_key_reads_as_api_key(self, temp_home, no_stdin, macos):
+        (temp_home / ".claude.json").write_text(json.dumps({
+            "oauthAccount": {"emailAddress": "me@example.com"},
+        }))
+        macos.set_password(*_managed_item(), "sk-ant-api03-key")
+        assert api.default_login() == api.DefaultLoginInfo(
+            kind="api_key", email=None, organization_uuid=None, expires_at=None
+        )
+        macos.delete_password(*_managed_item())
+        (temp_home / ".claude.json").write_text(json.dumps({
+            "primaryApiKey": "sk-ant-api03-key",
+        }))
+        _default_file(temp_home).write_text(json.dumps(_token_login("sk", None, 1)))
+        assert api.default_login().kind == "api_key"
+
+    def test_a_locked_keychain_is_an_error(
+        self, temp_home, no_stdin, macos, monkeypatch
+    ):
+        from claude_swap import macos_keychain
+
+        def locked(_service, _account):
+            raise macos_keychain.KeychainError("the keychain is locked")
+
+        monkeypatch.setattr(macos_keychain, "get_password", locked)
+        with pytest.raises(api.CredentialReadError, match="cannot be read now"):
+            api.default_login()
+
+    def test_refuses_another_profile_or_secure_store(
+        self, temp_home, no_stdin, monkeypatch, tmp_path
+    ):
+        other = temp_home / ".claude-work"
+        other.mkdir()
+        monkeypatch.setenv("CLAUDE_CONFIG_DIR", str(other))
+        for call in (
+            api.default_login,
+            api.forget_default_access_login,
+            lambda: api.use_access_login(tmp_path / "synced" / "b"),
+        ):
+            with pytest.raises(api.ConfigError, match="CLAUDE_CONFIG_DIR"):
+                call()
+        monkeypatch.delenv("CLAUDE_CONFIG_DIR")
+        monkeypatch.setenv("CLAUDE_SECURESTORAGE_CONFIG_DIR", str(other))
+        for call in (
+            api.default_login,
+            api.forget_default_access_login,
+            lambda: api.use_access_login(tmp_path / "synced" / "b"),
+        ):
+            with pytest.raises(api.ConfigError, match="CLAUDE_SECURESTORAGE"):
+                call()
+
+    def test_the_error_is_a_config_error(self):
+        assert issubclass(api.OwnLoginError, api.ConfigError)
+
+
+class TestUseAccessLogin:
+    """Claude Code's default login signed in with a kept access token (sak.13)."""
+
+    def test_signs_an_empty_keychain_item_in_in_place(
+        self, kept, macos, temp_home, capfd, caplog
+    ):
+        macos.set_password(*_default_item(), "")  # worker-1's empty item
+        (temp_home / ".claude.json").write_text(
+            json.dumps({"theme": "light", "projects": {"/x": {}}})
+        )
+        capfd.readouterr()
+        assert api.use_access_login(kept) is True
+        _assert_silent(capfd)
+        held = json.loads(macos.get_password(*_default_item()))
+        assert held == {"claudeAiOauth": _kept_login(kept)["claudeAiOauth"]}
+        assert held["claudeAiOauth"]["refreshToken"] is None
+        assert not _default_file(temp_home).exists()  # no file is made
+        assert _home_config(temp_home) == {
+            "theme": "light",
+            "projects": {"/x": {}},
+            "oauthAccount": _KEPT_ACCOUNT,
+            "hasCompletedOnboarding": True,
+        }
+        assert "sk-ant-oat01-kept" not in caplog.text
+
+    def test_that_very_login_again_changes_nothing(self, kept, macos, temp_home):
+        assert api.use_access_login(kept) is True
+        before = _everything(temp_home, macos)
+        assert api.use_access_login(kept) is False
+        assert _everything(temp_home, macos) == before
+
+    def test_keeps_what_claude_code_keeps_besides(self, kept, macos):
+        mcp = {"server": {"accessToken": "mcp"}}
+        macos.set_password(*_default_item(), json.dumps({
+            **_token_login("sk-old", None, 1),
+            "mcpOAuth": mcp,
+            "pluginSecrets": {"p": "s"},
+            "trustedDeviceToken": "another-logins-enrollment",
+        }))
+        api.use_access_login(kept)
+        held = json.loads(macos.get_password(*_default_item()))
+        assert held["mcpOAuth"] == mcp
+        assert held["pluginSecrets"] == {"p": "s"}
+        assert "trustedDeviceToken" not in held
+        assert held["claudeAiOauth"]["accessToken"] == "sk-ant-oat01-kept"
+
+    def test_an_existing_file_is_written_too(self, kept, macos, temp_home):
+        old = json.dumps(_token_login("sk-old", None, 1))
+        macos.set_password(*_default_item(), old)
+        _default_file(temp_home).write_text(old)
+        api.use_access_login(kept)
+        assert json.loads(_default_file(temp_home).read_text()) == json.loads(
+            macos.get_password(*_default_item())
+        )
+
+    def test_off_macos_the_file_holds_it(self, kept, linux, temp_home):
+        api.use_access_login(kept)
+        held = json.loads(_default_file(temp_home).read_text())
+        assert held["claudeAiOauth"]["accessToken"] == "sk-ant-oat01-kept"
+        if sys.platform != "win32":
+            assert _default_file(temp_home).stat().st_mode & 0o777 == 0o600
+
+    def test_a_newer_token_follows(self, kept, linux, temp_home):
+        api.use_access_login(kept)
+        api.keep_access_login(kept, **{**_KEPT, "access_token": "sk-ant-oat01-newer"})
+        assert api.use_access_login(kept) is True
+        held = json.loads(_default_file(temp_home).read_text())
+        assert held["claudeAiOauth"]["accessToken"] == "sk-ant-oat01-newer"
+
+    def test_another_accounts_login_replaces_it_and_its_account(
+        self, kept, linux, temp_home, tmp_path
+    ):
+        (temp_home / ".claude.json").write_text(json.dumps({
+            "oauthAccount": {
+                "emailAddress": "b@example.com",
+                "organizationUuid": "org-2",
+                "displayName": "Bee",
+            },
+        }))
+        api.use_access_login(kept)
+        assert _home_config(temp_home)["oauthAccount"] == {
+            **_KEPT_ACCOUNT, "displayName": "Bee",
+        }
+        other = tmp_path / "synced" / "c"
+        api.keep_access_login(other, **{
+            **_KEPT,
+            "access_token": "sk-ant-oat01-c",
+            "email": "c@example.com",
+            "organization_uuid": None,
+            "organization": None,
+            "account_uuid": "uuid-3",
+        })
+        assert api.use_access_login(other) is True
+        assert _home_config(temp_home)["oauthAccount"] == {
+            "accountUuid": "uuid-3", "emailAddress": "c@example.com",
+        }
+        assert api.default_login().email == "c@example.com"
+
+    @pytest.mark.parametrize(
+        "where",
+        [
+            "item", "file", "setup-token", "early-setup-token", "managed-key",
+            "config-key",
+        ],
+    )
+    def test_never_touches_a_login_of_its_own(self, kept, macos, temp_home, where):
+        """``forget_default_access_login`` refuses too, as nothing else is
+        left there (TestLeftoverAccess: an access token left beside one)."""
+        own = json.dumps(_token_login("sk-own", "rt-own", _in(hours=8)))
+        if where == "item":
+            macos.set_password(*_default_item(), own)
+        elif where == "file":
+            _default_file(temp_home).write_text(own)
+        elif where == "setup-token":
+            macos.set_password(*_default_item(), json.dumps({"claudeAiOauth": {
+                "accessToken": "sk-ant-oat01-t", "scopes": ["user:inference"],
+            }}))
+        elif where == "early-setup-token":
+            macos.set_password(
+                *_default_item(),
+                json.dumps({"claudeAiOauth": {"accessToken": "sk-ant-oat01-t"}}),
+            )
+        elif where == "managed-key":
+            macos.set_password(*_managed_item(), "sk-ant-api03-key")
+        else:
+            (temp_home / ".claude.json").write_text(
+                json.dumps({"primaryApiKey": "sk-ant-api03-key"})
+            )
+        before = _everything(temp_home, macos)
+        with pytest.raises(api.OwnLoginError, match="left as it is"):
+            api.use_access_login(kept)
+        with pytest.raises(api.OwnLoginError, match="left as it is"):
+            api.forget_default_access_login()
+        assert _everything(temp_home, macos) == before
+
+    @pytest.mark.parametrize(
+        "case", ["missing", "empty", "own", "no-account", "no-scopes"]
+    )
+    def test_refuses_a_profile_without_a_kept_login(
+        self, temp_home, no_stdin, macos, tmp_path, case
+    ):
+        profile = tmp_path / "synced" / "b"
+        if case != "missing":
+            profile.mkdir(parents=True)
+        if case in ("own", "no-account", "no-scopes"):
+            login = _token_login("sk-x", "rt-x" if case == "own" else None, 1)
+            if case == "no-scopes":
+                del login["claudeAiOauth"]["scopes"]
+            (profile / ".credentials.json").write_text(json.dumps(login))
+        if case not in ("missing", "no-account"):
+            (profile / ".claude.json").write_text(
+                json.dumps({"oauthAccount": _KEPT_ACCOUNT})
+            )
+        before = _everything(temp_home, macos)
+        with pytest.raises(api.ConfigError):
+            api.use_access_login(profile)
+        assert _everything(temp_home, macos) == before
+        assert profile.exists() is (case != "missing")
+
+    def test_refuses_places_that_are_not_a_profile_of_its_own(
+        self, temp_home, no_stdin, linux
+    ):
+        from claude_swap.paths import get_backup_root
+
+        for place, match in (
+            (temp_home / ".claude", "default profile"),
+            (temp_home, "default profile"),
+            (get_backup_root() / "synced", "own store"),
+            ("relative/b", "full path"),
+        ):
+            with pytest.raises(api.ConfigError, match=match):
+                api.use_access_login(place)
+        assert not _default_file(temp_home).exists()
+
+    def test_an_unreadable_keychain_changes_nothing(
+        self, kept, macos, temp_home, monkeypatch
+    ):
+        from claude_swap import macos_keychain
+
+        def locked(service, account):
+            if service == "Claude Code-credentials":
+                raise macos_keychain.KeychainError("the keychain is locked")
+            return macos.get_password(service, account)
+
+        monkeypatch.setattr(macos_keychain, "get_password", locked)
+        before = _everything(temp_home, macos)
+        with pytest.raises(api.CredentialReadError, match="cannot be read now"):
+            api.use_access_login(kept)
+        assert _everything(temp_home, macos) == before
+
+    def test_never_writes_over_a_claude_json_it_cannot_read(
+        self, kept, linux, temp_home
+    ):
+        (temp_home / ".claude.json").write_text('{"projects": ')
+        with pytest.raises(api.ConfigError, match="Repair or move"):
+            api.use_access_login(kept)
+        assert (temp_home / ".claude.json").read_text() == '{"projects": '
+        assert not _default_file(temp_home).exists()
+
+    def test_waits_for_claude_codes_locks(self, kept, linux, temp_home, monkeypatch):
+        from claude_swap import claude_locks
+
+        monkeypatch.setattr(claude_locks, "DEFAULT_TIMEOUT_S", 0.3)
+        for lock in (
+            temp_home / ".claude" / ".oauth_refresh.lock",
+            temp_home / ".claude.lock",
+            temp_home / ".claude" / ".storage-write.lock",
+            temp_home / ".claude.json.lock",
+            kept / ".storage-write.lock",
+        ):
+            lock.mkdir()
+            with pytest.raises(api.LockError, match="right now"):
+                api.use_access_login(kept)
+            lock.rmdir()
+            assert not _default_file(temp_home).exists()
+        assert api.use_access_login(kept) is True
+
+    def test_waits_for_a_switch(self, kept, linux, temp_home, monkeypatch):
+        from claude_swap.locking import FileLock
+        from claude_swap.paths import get_backup_root
+
+        monkeypatch.setattr(api, "DEFAULT_LOGIN_LOCK_TIMEOUT", 0.2)
+        switch = FileLock(get_backup_root() / ".lock")
+        assert switch.acquire()
+        try:
+            with pytest.raises(api.LockError, match="switching"):
+                api.use_access_login(kept)
+            with pytest.raises(api.LockError, match="switching"):
+                api.forget_default_access_login()
+        finally:
+            switch.release()
+        assert not _default_file(temp_home).exists()
+
+    def test_the_login_is_put_back_when_its_account_cannot_be_recorded(
+        self, kept, macos, temp_home, monkeypatch
+    ):
+        old = json.dumps(_token_login("sk-old", None, 1))
+        macos.set_password(*_default_item(), old)
+
+        def full_disk(_config):
+            raise api.CredentialWriteError("No space left on device")
+
+        monkeypatch.setattr(api, "_write_default_config", full_disk)
+        with pytest.raises(api.CredentialWriteError, match="No space"):
+            api.use_access_login(kept)
+        assert macos.get_password(*_default_item()) == old
+        assert not _default_file(temp_home).exists()
+
+    def test_never_shows_the_token(self, kept, macos, temp_home, caplog, capfd):
+        import logging
+
+        caplog.set_level(logging.DEBUG, logger="claude-swap")
+        capfd.readouterr()
+        api.use_access_login(kept)
+        info = api.default_login()
+        api.forget_default_access_login()
+        out, err = capfd.readouterr()
+        assert "sk-ant-oat01-kept" not in caplog.text + out + err + repr(info)
+
+
+class TestForgetDefaultAccessLogin:
+    """The access-only default login removed again (sak.13)."""
+
+    def test_removes_the_login_and_its_account(self, kept, macos, temp_home, capfd):
+        (temp_home / ".claude.json").write_text(json.dumps({"theme": "light"}))
+        api.use_access_login(kept)
+        capfd.readouterr()
+        assert api.forget_default_access_login() is True
+        _assert_silent(capfd)
+        assert macos.get_password(*_default_item()) is None
+        assert _home_config(temp_home) == {
+            "theme": "light", "hasCompletedOnboarding": True,
+        }
+        assert api.default_login().kind == "none"
+        assert api.forget_default_access_login() is False
+
+    def test_keeps_what_claude_code_keeps_besides(self, kept, macos):
+        mcp = {"server": {"accessToken": "mcp"}}
+        macos.set_password(*_default_item(), json.dumps({"mcpOAuth": mcp}))
+        api.use_access_login(kept)
+        assert api.forget_default_access_login() is True
+        assert json.loads(macos.get_password(*_default_item())) == {"mcpOAuth": mcp}
+
+    def test_the_file_goes_when_nothing_else_is_left(self, kept, linux, temp_home):
+        api.use_access_login(kept)
+        assert api.forget_default_access_login() is True
+        assert not _default_file(temp_home).exists()
+        mcp = {"server": {"accessToken": "mcp"}}
+        _default_file(temp_home).write_text(json.dumps({"mcpOAuth": mcp}))
+        api.use_access_login(kept)
+        api.forget_default_access_login()
+        assert json.loads(_default_file(temp_home).read_text()) == {"mcpOAuth": mcp}
+        if sys.platform != "win32":
+            assert _default_file(temp_home).stat().st_mode & 0o777 == 0o600
+
+    def test_an_empty_item_is_no_login(self, temp_home, no_stdin, macos):
+        macos.set_password(*_default_item(), "")
+        assert api.forget_default_access_login() is False
+        assert macos.get_password(*_default_item()) == ""
+
+    def test_a_login_that_stays_is_an_error_and_a_retry_ends_it(
+        self, kept, macos, temp_home, monkeypatch
+    ):
+        from claude_swap import macos_keychain
+
+        api.use_access_login(kept)
+
+        def locked(_service, _account):
+            raise macos_keychain.KeychainError("the keychain is locked")
+
+        monkeypatch.setattr(macos_keychain, "delete_password", locked)
+        with pytest.raises(api.CredentialWriteError, match="Keychain"):
+            api.forget_default_access_login()
+        assert "oauthAccount" not in _home_config(temp_home)
+        monkeypatch.setattr(macos_keychain, "delete_password", macos.delete_password)
+        assert api.forget_default_access_login() is True
+        assert macos.get_password(*_default_item()) is None
+
+
+def _lend_live(seeded, email: str = "b@example.com", num: int = 2) -> None:
+    """Make the default login an access token another computer lent for an
+    account claude-swap also has here (sak.13)."""
+    _make_live(seeded, _token_login("sk-ant-oat01-lent", None, _in(hours=1)))
+    (seeded.temp_home / ".claude.json").write_text(json.dumps({
+        "oauthAccount": {"emailAddress": email, "accountUuid": f"uuid-{num}"},
+    }))
+
+
+class TestALentDefaultLogin:
+    """The facade with an access token another computer lent in the default
+    profile (sak.13): it is no login of this computer's own, so the
+    account's stored login stays its login here."""
+
+    def test_its_account_is_not_the_active_one(self, seeded, linux):
+        _lend_live(seeded)
+        assert api.active_account(seeded.switcher) is None
+        rows = api.accounts_json(seeded.switcher)["accounts"]
+        assert [row["active"] for row in rows] == [False, False]
+
+    def test_access_token_hands_out_the_stored_login(self, seeded, linux, endpoint):
+        _keep_stored(seeded, _token_login("sk-ant-oat01-b", "rt-2", _in(hours=3)))
+        _lend_live(seeded)
+        info = api.access_token(seeded.switcher, "2", renew_within=900)
+        assert info.access_token == "sk-ant-oat01-b"
+        assert info.renewed is False
+        assert endpoint.posted == []
+
+    def test_it_is_never_added(self, seeded, linux):
+        _lend_live(seeded)
+        with pytest.raises(api.ValidationError, match="claude /login"):
+            api.add_current_login(seeded.switcher)
+        assert _numbers(seeded) == [1, 2]
+
+    def test_a_profile_login_of_its_account_is_stored(self, seeded, linux, target):
+        _lend_live(seeded)
+        (target / ".credentials.json").write_text(_copy_text())
+        (target / ".claude.json").write_text(json.dumps({
+            "oauthAccount": {"emailAddress": "b@example.com", "accountUuid": "uuid-2"},
+        }))
+        added = api.add_profile_login(seeded.switcher, target)
+        assert added == api.AddedAccount(slot="2", email="b@example.com", created=False)
+        assert seeded.switcher.read_account_credentials("2", "b@example.com") == (
+            _copy_text()
+        )
+
+    def test_a_copy_for_its_account_is_taken(self, seeded, linux, target, monkeypatch):
+        anthropic = _Anthropic()
+        monkeypatch.setattr("claude_swap.oauth.fetch_oauth_profile", anthropic.profile)
+        _give_org(seeded, 2, "org-2")
+        anthropic.owners["sk-ant-oat01-copy"] = _owner(2, "b@example.com", "org-2")
+        _lend_live(seeded)
+        config = _home_config(seeded.temp_home)
+        config["oauthAccount"]["organizationUuid"] = "org-2"
+        (seeded.temp_home / ".claude.json").write_text(json.dumps(config))
+        copied = api.add_login_copy(
+            seeded.switcher, target, credentials=_copy_text(), account="2"
+        )
+        assert copied.default_login is False
+        assert copied.account == api.AddedAccount(
+            slot="2", email="b@example.com", created=False
+        )
+
+    def test_its_account_may_be_handed_over(self, seeded, linux, tmp_path):
+        stored = _store_login(seeded)
+        _lend_live(seeded)
+        handed = api.hand_over_login(seeded.switcher, "2", tmp_path / "b.json")
+        assert handed.slot == "2"
+        assert json.loads((tmp_path / "b.json").read_text()) == stored
+        assert _numbers(seeded) == [1]
+
+    def test_a_session_profile_may_be_made_for_it(self, seeded, linux, monkeypatch):
+        from claude_swap.session import SessionManager
+
+        calls = []
+
+        def fake_setup(self, identifier, share, share_history=False):
+            calls.append(identifier)
+            return Path("/x"), "2", "b@example.com"
+
+        monkeypatch.setattr(SessionManager, "setup_session", fake_setup)
+        _lend_live(seeded)
+        api.prepare_session_profile(seeded.switcher, "2")
+        assert calls == ["2"]
+
+    def test_a_switch_puts_the_accounts_own_login_in(self, linux, seeded, kept):
+        _lend_live(seeded)
+        payload = api.switch_to(seeded.switcher, "2")
+        assert payload["switched"] is True
+        assert _live(seeded)["claudeAiOauth"]["refreshToken"] == "rt-2"
+        assert api.default_login().kind == "own"
+        with pytest.raises(api.OwnLoginError):
+            api.use_access_login(kept)
+        assert _stored(seeded)["claudeAiOauth"]["refreshToken"] == "rt-2"
+
+
+class TestClaudeSwapsOwnLogins:
+    """What makes the default login one of this computer's own besides a
+    refresh token (sak.13): a setup-token, an access token without its
+    expiry, an access token alone of one of claude-swap's accounts here. It
+    reads as "own" and is never replaced or removed."""
+
+    @staticmethod
+    def _left_alone(home: Path, kept: Path, keychain=None) -> None:
+        before = _everything(home, keychain)
+        with pytest.raises(api.OwnLoginError, match="left as it is"):
+            api.use_access_login(kept)
+        with pytest.raises(api.OwnLoginError, match="left as it is"):
+            api.forget_default_access_login()
+        assert _everything(home, keychain) == before
+
+    def test_an_active_setup_token_account(self, linux, seeded, kept):
+        added = api.add_setup_token(
+            seeded.switcher, "sk-ant-oat01-setup", email="ci@example.com"
+        )
+        assert api.switch_to(seeded.switcher, added.slot)["switched"] is True
+        assert _live(seeded)["claudeAiOauth"]["accessToken"] == "sk-ant-oat01-setup"
+        info = api.default_login()
+        assert info.kind == "own"
+        assert info.email == "ci@example.com"
+        self._left_alone(seeded.temp_home, kept)
+
+    def test_an_access_token_alone_of_one_of_its_accounts(self, linux, seeded, kept):
+        _lend_live(seeded)
+        info = api.default_login()
+        assert (info.kind, info.email) == ("own", "b@example.com")
+        assert info.expires_at is not None
+        assert info.leftover_access is False  # it is the login there, no leftover
+        self._left_alone(seeded.temp_home, kept)
+        # matched as current_account_number() matches: email and organization
+        config = _home_config(seeded.temp_home)
+        config["oauthAccount"]["organizationUuid"] = "org-elsewhere"
+        (seeded.temp_home / ".claude.json").write_text(json.dumps(config))
+        assert api.default_login().kind == "access"
+
+    def test_in_the_keychain_item_too(self, macos, seeded, kept):
+        _lend_live(seeded)
+        _default_file(seeded.temp_home).unlink()
+        lent = _token_login("sk-ant-oat01-lent", None, _in(hours=1))
+        macos.set_password(*_default_item(), json.dumps(lent))
+        assert api.default_login().kind == "own"
+        self._left_alone(seeded.temp_home, kept, macos)
+
+    @pytest.mark.parametrize("expires", ["missing", None, "1900000000000", True])
+    def test_an_access_token_without_its_expiry(
+        self, temp_home, no_stdin, linux, kept, expires
+    ):
+        login = _token_login("sk-ant-oat01-a", None, 0)
+        if expires == "missing":
+            del login["claudeAiOauth"]["expiresAt"]
+        else:
+            login["claudeAiOauth"]["expiresAt"] = expires
+        _default_file(temp_home).write_text(json.dumps(login))
+        assert api.default_login().kind == "own"
+        self._left_alone(temp_home, kept)
+
+    def test_a_kept_login_of_one_of_its_accounts_is_not_put_in(
+        self, linux, seeded, kept
+    ):
+        _give_org(seeded, 2, "org-2")  # account 2 is the account kept
+        _default_file(seeded.temp_home).unlink()  # logged out here
+        (seeded.temp_home / ".claude.json").write_text("{}")
+        before = _everything(seeded.temp_home, None)
+        with pytest.raises(api.ConfigError, match="account 2 of claude") as refused:
+            api.use_access_login(kept)
+        assert not isinstance(refused.value, api.OwnLoginError)
+        assert "cswap switch 2" in str(refused.value)
+        assert _everything(seeded.temp_home, None) == before
+
+    def test_an_account_list_it_cannot_read_is_an_error(self, linux, seeded):
+        _lend_live(seeded)
+        seeded.switcher.sequence_file.write_text('{"accounts": ')
+        with pytest.raises(api.ConfigError, match="account list"):
+            api.default_login()
+        seeded.make_live("a@example.com", 1)  # a refresh token needs no list
+        assert api.default_login().kind == "own"
+
+
+# -- sak.13 review fixes ----------------------------------------------------------
+
+
+def _read_degraded(monkeypatch, seeded) -> None:
+    """The Keychain read failed this pass and the file covered for it: the
+    bytes served may be an older generation of the live login."""
+    from claude_swap.credentials import ActiveCredentials
+
+    live = (seeded.temp_home / ".claude" / ".credentials.json").read_text()
+    degraded = ActiveCredentials(live, False, True)
+    monkeypatch.setattr(seeded.switcher, "_read_active_credentials", lambda: degraded)
+
+
+class TestADefaultLoginThatCannotBeReadNow:
+    """A login of the account the default profile is logged in to is neither
+    stored nor dropped while that live login cannot be read cleanly: whether
+    the account's stored login follows it cannot be told then."""
+
+    @pytest.fixture
+    def anthropic(self, monkeypatch) -> _Anthropic:
+        fake = _Anthropic()
+        monkeypatch.setattr("claude_swap.oauth.fetch_oauth_profile", fake.profile)
+        monkeypatch.setattr(
+            "claude_swap.oauth.try_refresh_oauth_credentials", fake.refresh
+        )
+        return fake
+
+    @staticmethod
+    def _stored_one(seeded) -> str:
+        return seeded.switcher.read_account_credentials("1", "a@example.com")
+
+    def test_add_profile_login(self, seeded, target, monkeypatch):
+        (target / ".credentials.json").write_text(_copy_text())
+        (target / ".claude.json").write_text(json.dumps({
+            "oauthAccount": {"emailAddress": "a@example.com", "accountUuid": "uuid-1"},
+        }))
+        before = self._stored_one(seeded)
+        _read_degraded(monkeypatch, seeded)
+        with pytest.raises(api.CredentialReadError, match="cannot be read now"):
+            api.add_profile_login(seeded.switcher, target)
+        assert self._stored_one(seeded) == before
+        assert (target / ".credentials.json").read_text() == _copy_text()
+
+    def test_import_login(self, seeded, tmp_path, claude, target, monkeypatch):
+        before = self._stored_one(seeded)
+        claude.plan("ok", email="a@example.com", uuid="uuid-1")
+        source = _login_file(tmp_path / "a.json")
+        _read_degraded(monkeypatch, seeded)
+        with pytest.raises(api.LoginNotAddedError, match="cannot be read") as raised:
+            api.import_login(seeded.switcher, source, target, claude=claude.path)
+        assert raised.value.config_dir == str(target)
+        assert "sk-ant-ort01-moved" in (target / ".credentials.json").read_text()
+        assert self._stored_one(seeded) == before
+        assert _numbers(seeded) == [1, 2]
+
+    def test_add_login_copy(self, seeded, temp_home, target, anthropic, monkeypatch):
+        _give_org(seeded, 1, "org-1")
+        (temp_home / ".claude.json").write_text(json.dumps({
+            "oauthAccount": {
+                "emailAddress": "a@example.com",
+                "accountUuid": "uuid-1",
+                "organizationUuid": "org-1",
+            },
+        }))
+        anthropic.owners["sk-ant-oat01-copy"] = _owner(1, "a@example.com", "org-1")
+        before = self._stored_one(seeded)
+        _read_degraded(monkeypatch, seeded)
+        with pytest.raises(api.CredentialReadError, match="cannot be read now"):
+            api.add_login_copy(seeded.switcher, target, credentials=_copy_text())
+        assert self._stored_one(seeded) == before
+        assert _numbers(seeded) == [1, 2]
+
+
+def _own_file_in(layout: str, entry: dict) -> tuple[str, str]:
+    """A ``.credentials.json`` with ``entry`` as its login, written in
+    ``layout``, and the text of that login in it."""
+    if layout == "compact":  # as Claude Code writes it
+        login = json.dumps(entry, separators=(",", ":"))
+        return login, '{"claudeAiOauth":' + login + "}"
+    if layout == "spaced":
+        login = json.dumps(entry)
+        return login, '{"claudeAiOauth": ' + login + "}"
+    if layout == "indented":
+        login = json.dumps(entry, indent=4)
+        return login, '{\n  "claudeAiOauth": ' + login + "\n}\n"
+    login = json.dumps(entry, ensure_ascii=False, separators=(" ,\t", " :\r\n"))
+    return login, (
+        '\t{ "trustedDeviceToken" : "tdt-own" ,\r\n "claudeAiOauth"\t:'
+        + login
+        + ' , "mcpOAuth":{"mine":{"accessToken":"m"}} }\n'
+    )
+
+
+class TestLeftoverAccess:
+    """An access token alone left in one of Claude Code's stores next to a
+    login of the computer's own or an API key: ``leftover_access`` says so,
+    and ``forget_default_access_login`` removes only that token, leaving the
+    own login and ``~/.claude.json`` as they are."""
+
+    def test_a_stale_file_next_to_an_own_keychain_login(self, kept, macos, temp_home):
+        own = json.dumps(_token_login("sk-own", "rt-own", _in(hours=8)))
+        macos.set_password(*_default_item(), own)
+        mcp = {"server": {"accessToken": "mcp"}}
+        _default_file(temp_home).write_text(json.dumps({
+            **_token_login("sk-ant-oat01-old", None, _in(hours=1)), "mcpOAuth": mcp,
+        }))
+        config = {"oauthAccount": {"emailAddress": "me@example.com"}, "theme": "dark"}
+        (temp_home / ".claude.json").write_text(json.dumps(config))
+        info = api.default_login()
+        assert (info.kind, info.leftover_access) == ("own", True)
+        with pytest.raises(api.OwnLoginError, match="left as it is"):
+            api.use_access_login(kept)
+        assert api.forget_default_access_login() is True
+        assert macos.get_password(*_default_item()) == own
+        assert json.loads(_default_file(temp_home).read_text()) == {"mcpOAuth": mcp}
+        assert _home_config(temp_home) == config
+        info = api.default_login()
+        assert (info.kind, info.leftover_access) == ("own", False)
+        with pytest.raises(api.OwnLoginError, match="left as it is"):
+            api.forget_default_access_login()
+
+    def test_a_keychain_item_hiding_an_own_login_in_the_file(
+        self, kept, macos, temp_home
+    ):
+        own = json.dumps(_token_login("sk-own", "rt-own", _in(hours=8)))
+        _default_file(temp_home).write_text(own)
+        lent = _token_login("sk-ant-oat01-lent", None, _in(hours=1))
+        macos.set_password(*_default_item(), json.dumps(lent))
+        (temp_home / ".claude.json").write_text(
+            json.dumps({"oauthAccount": {"emailAddress": "me@example.com"}})
+        )
+        config = (temp_home / ".claude.json").read_text()
+        assert api.default_login().leftover_access is True
+        assert api.forget_default_access_login() is True
+        assert macos.get_password(*_default_item()) is None  # the file is read again
+        assert _default_file(temp_home).read_text() == own
+        assert (temp_home / ".claude.json").read_text() == config
+        assert api.default_login().leftover_access is False
+
+    def test_what_the_item_keeps_besides_moves_next_to_the_own_login(
+        self, kept, macos, temp_home
+    ):
+        """Claude Code reads the item while it holds JSON, so a leftover item
+        that keeps an MCP server's login besides goes whole; what it keeps
+        moves into the file, and the lent login's device token goes too."""
+        own = _token_login("sk-own", "rt-own", _in(hours=8))
+        _default_file(temp_home).write_text(json.dumps(own, separators=(",", ":")))
+        mcp = {"server|1": {"accessToken": "mcp", "expiresAt": 1}}
+        plugins = {"plugin": {"key": "secret"}}
+        macos.set_password(*_default_item(), json.dumps({
+            **_token_login("sk-ant-oat01-lent", None, _in(hours=1)),
+            "mcpOAuth": mcp,
+            "pluginSecrets": plugins,
+            "trustedDeviceToken": "tdt-lent",
+        }))
+        (temp_home / ".claude.json").write_text(
+            json.dumps({"oauthAccount": {"emailAddress": "me@example.com"}})
+        )
+        config = (temp_home / ".claude.json").read_text()
+        info = api.default_login()
+        assert (info.kind, info.leftover_access) == ("own", True)
+        assert api.forget_default_access_login() is True
+        assert macos.get_password(*_default_item()) is None
+        text = _default_file(temp_home).read_text()
+        assert json.loads(text) == {**own, "mcpOAuth": mcp, "pluginSecrets": plugins}
+        assert "sk-ant-oat01-lent" not in text and "tdt-lent" not in text
+        if sys.platform != "win32":
+            assert _default_file(temp_home).stat().st_mode & 0o777 == 0o600
+        assert (temp_home / ".claude.json").read_text() == config
+        info = api.default_login()
+        assert (info.kind, info.leftover_access) == ("own", False)
+        with pytest.raises(api.OwnLoginError, match="left as it is"):
+            api.forget_default_access_login()
+
+    @pytest.mark.parametrize("layout", ["compact", "spaced", "indented", "unusual"])
+    def test_the_own_login_stays_byte_for_byte(self, kept, macos, temp_home, layout):
+        entry = _token_login("sk-own", "rt-own", _in(hours=8), note='"}{,:[" \\ é\t')[
+            "claudeAiOauth"
+        ]
+        login, written = _own_file_in(layout, entry)
+        _default_file(temp_home).write_bytes(written.encode())
+        mcp = {"server": {"accessToken": "mcp"}}
+        macos.set_password(*_default_item(), json.dumps(
+            {**_token_login("sk-ant-oat01-lent", None, _in(hours=1)), "mcpOAuth": mcp}
+        ))
+        before = json.loads(written)
+        assert api.forget_default_access_login() is True
+        text = _default_file(temp_home).read_bytes().decode()
+        assert login in text
+        assert json.loads(text) == {
+            **before, "mcpOAuth": {**before.get("mcpOAuth", {}), **mcp}
+        }
+
+    def test_the_files_own_keys_win(self, kept, macos, temp_home):
+        own = {
+            **_token_login("sk-own", "rt-own", _in(hours=8)),
+            "trustedDeviceToken": "tdt-own",
+            "mcpOAuth": {"shared": {"accessToken": "file"}},
+            "mcpXaaIdp": "file",
+        }
+        _default_file(temp_home).write_text(json.dumps(own))
+        more = {"accessToken": "o"}
+        macos.set_password(*_default_item(), json.dumps({
+            **_token_login("sk-ant-oat01-lent", None, _in(hours=1)),
+            "trustedDeviceToken": "tdt-lent",
+            "mcpOAuth": {"shared": {"accessToken": "item"}, "more": more},
+            "mcpXaaIdp": {"idp": "item"},
+            "laterKey": [1, 2],
+        }))
+        assert api.forget_default_access_login() is True
+        assert json.loads(_default_file(temp_home).read_text()) == {
+            **own,
+            "mcpOAuth": {"shared": {"accessToken": "file"}, "more": more},
+            "laterKey": [1, 2],
+        }
+        assert macos.get_password(*_default_item()) is None
+
+    def test_a_failed_write_of_the_own_file_changes_nothing(
+        self, kept, macos, temp_home, monkeypatch
+    ):
+        _default_file(temp_home).write_text(
+            json.dumps(_token_login("sk-own", "rt-own", _in(hours=8)))
+        )
+        macos.set_password(*_default_item(), json.dumps({
+            **_token_login("sk-ant-oat01-lent", None, _in(hours=1)),
+            "mcpOAuth": {"server": {"accessToken": "mcp"}},
+        }))
+        (temp_home / ".claude.json").write_text(
+            json.dumps({"oauthAccount": {"emailAddress": "me@example.com"}})
+        )
+        before = _everything(temp_home, macos)
+
+        def full_disk(source, target):
+            raise OSError(28, "No space left on device")
+
+        monkeypatch.setattr(api, "replace_with_retry", full_disk)
+        with pytest.raises(api.CredentialWriteError, match="No space"):
+            api.forget_default_access_login()
+        assert _everything(temp_home, macos) == before
+        assert [
+            path.name
+            for path in (temp_home / ".claude").iterdir()
+            if "credentials" in path.name
+        ] == [".credentials.json"]  # no copy of the file is left behind
+        info = api.default_login()
+        assert (info.kind, info.leftover_access) == ("own", True)
+
+    def test_a_failed_removal_of_the_item_is_finished_by_a_retry(
+        self, kept, macos, temp_home, monkeypatch
+    ):
+        from claude_swap import macos_keychain
+
+        own = _token_login("sk-own", "rt-own", _in(hours=8))
+        _default_file(temp_home).write_text(json.dumps(own))
+        mcp = {"server": {"accessToken": "mcp"}}
+        item = json.dumps(
+            {**_token_login("sk-ant-oat01-lent", None, _in(hours=1)), "mcpOAuth": mcp}
+        )
+        macos.set_password(*_default_item(), item)
+
+        def busy(service, account):
+            raise macos_keychain.KeychainError("security timed out")
+
+        monkeypatch.setattr(macos_keychain, "delete_password", busy)
+        with pytest.raises(api.CredentialWriteError, match="Keychain"):
+            api.forget_default_access_login()
+        assert macos.get_password(*_default_item()) == item  # the token stays there
+        moved = {**own, "mcpOAuth": mcp}
+        assert json.loads(_default_file(temp_home).read_text()) == moved
+        assert api.default_login().leftover_access is True
+        monkeypatch.setattr(macos_keychain, "delete_password", macos.delete_password)
+        assert api.forget_default_access_login() is True
+        assert macos.get_password(*_default_item()) is None
+        assert json.loads(_default_file(temp_home).read_text()) == moved
+        assert api.default_login().leftover_access is False
+
+    def test_an_api_key_with_an_access_token_left(self, kept, linux, temp_home):
+        (temp_home / ".claude.json").write_text(
+            json.dumps({"primaryApiKey": "sk-ant-api03-key"})
+        )
+        lent = _token_login("sk-ant-oat01-lent", None, _in(hours=1))
+        _default_file(temp_home).write_text(json.dumps(lent))
+        info = api.default_login()
+        assert (info.kind, info.leftover_access) == ("api_key", True)
+        assert api.forget_default_access_login() is True
+        assert not _default_file(temp_home).exists()
+        assert _home_config(temp_home) == {"primaryApiKey": "sk-ant-api03-key"}
+
+    def test_the_file_one_failed_keychain_write_left_is_removed(
+        self, kept, macos, temp_home, monkeypatch
+    ):
+        """One failed Keychain write puts the login in the file, later writes
+        keep the file, and the user's own login then goes into the Keychain
+        item only (``claude /login`` in a terminal)."""
+        from claude_swap import macos_keychain
+
+        failed: list[str] = []
+
+        def flaky_set(service, account, password):
+            if service == "Claude Code-credentials" and not failed:
+                failed.append(service)
+                raise macos_keychain.KeychainError("security timed out")
+            return macos.set_password(service, account, password)
+
+        monkeypatch.setattr(macos_keychain, "set_password", flaky_set)
+        api.use_access_login(kept)
+        assert _default_file(temp_home).exists()
+        api.keep_access_login(kept, **{**_KEPT, "access_token": "sk-ant-oat01-newer"})
+        api.use_access_login(kept)  # the item takes it again; the file is rewritten
+        own = json.dumps(_token_login("sk-own", "rt-own", _in(hours=8)))
+        macos.set_password(*_default_item(), own)
+        info = api.default_login()
+        assert (info.kind, info.leftover_access) == ("own", True)
+        assert api.forget_default_access_login() is True
+        assert not _default_file(temp_home).exists()
+        assert macos.get_password(*_default_item()) == own
+
+
+class TestALegacyStoreOnLinux:
+    """Linux/WSL: a legacy ``~/.claude-swap-backup`` not moved yet is moved
+    first, as opening claude-swap moves it, so no lock or read of the
+    default-login functions leaves the new store beside it."""
+
+    @staticmethod
+    def _legacy(home: Path) -> Path:
+        legacy = home / ".claude-swap-backup"
+        legacy.mkdir()
+        (legacy / "sequence.json").write_text(json.dumps({
+            "activeAccountNumber": 1,
+            "sequence": [1],
+            "accounts": {"1": {"email": "a@example.com", "organizationUuid": ""}},
+        }))
+        return legacy
+
+    @staticmethod
+    def _new_store(home: Path) -> Path:
+        return home / ".local" / "share" / "claude-swap"
+
+    def test_forget_moves_it_first(self, temp_home, no_stdin, linux):
+        from claude_swap.switcher import ClaudeAccountSwitcher
+
+        legacy = self._legacy(temp_home)
+        assert api.forget_default_access_login() is False
+        assert not legacy.exists()
+        moved = json.loads((self._new_store(temp_home) / "sequence.json").read_text())
+        assert moved["sequence"] == [1]
+        ClaudeAccountSwitcher()  # opens: no "both paths exist" refusal
+
+    def test_its_accounts_count_before_it_is_moved(self, temp_home, no_stdin, linux):
+        self._legacy(temp_home)
+        lent = _token_login("sk-ant-oat01-lent", None, _in(hours=1))
+        _default_file(temp_home).write_text(json.dumps(lent))
+        (temp_home / ".claude.json").write_text(
+            json.dumps({"oauthAccount": {"emailAddress": "a@example.com"}})
+        )
+        assert api.default_login().kind == "own"
+
+    def test_a_store_it_cannot_move_is_a_config_error(
+        self, temp_home, no_stdin, linux, kept
+    ):
+        legacy = self._legacy(temp_home)
+        new = self._new_store(temp_home)
+        new.mkdir(parents=True)
+        (new / "sequence.json").write_text("{}")  # both hold accounts: never merged
+        calls = (api.forget_default_access_login, lambda: api.use_access_login(kept))
+        for call in calls:
+            with pytest.raises(api.ConfigError, match="cannot be used now"):
+                call()
+        assert (legacy / "sequence.json").exists()
+        assert sorted(p.name for p in new.iterdir()) == ["sequence.json"]
+
+
+class TestATransientKeychainFailure:
+    """The default-login functions read the Keychain with claude-swap's
+    bounded retry, as its active read does."""
+
+    def test_a_read_that_fails_once_is_tried_again(
+        self, temp_home, no_stdin, macos, monkeypatch
+    ):
+        from claude_swap import macos_keychain
+
+        monkeypatch.setattr(api, "_ACTIVE_READ_RETRY_DELAY", 0)
+        tries: list[str] = []
+
+        def flaky_get(service, account):
+            tries.append(service)
+            if service == "Claude Code-credentials" and tries.count(service) == 1:
+                raise macos_keychain.KeychainError("security timed out")
+            return macos.get_password(service, account)
+
+        monkeypatch.setattr(macos_keychain, "get_password", flaky_get)
+        own = _token_login("sk-own", "rt-own", _in(hours=8))
+        macos.set_password(*_default_item(), json.dumps(own))
+        assert api.default_login().kind == "own"
+        assert tries.count("Claude Code-credentials") == 2
+
+    def test_a_keychain_that_stays_locked_is_an_error(
+        self, temp_home, no_stdin, macos, monkeypatch, kept
+    ):
+        from claude_swap import macos_keychain
+
+        monkeypatch.setattr(api, "_ACTIVE_READ_RETRY_DELAY", 0)
+        tries: list[str] = []
+
+        def locked(service, account):
+            tries.append(service)
+            raise macos_keychain.KeychainError("the keychain is locked")
+
+        monkeypatch.setattr(macos_keychain, "get_password", locked)
+        with pytest.raises(api.CredentialReadError, match="cannot be read now"):
+            api.default_login()
+        assert tries == ["Claude Code-credentials"] * 2
+        tries.clear()
+        with pytest.raises(api.CredentialReadError):
+            api.use_access_login(kept)
+        assert len(tries) == 2  # the profile's own item, then nothing more

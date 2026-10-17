@@ -36,6 +36,7 @@ from claude_swap.switcher import (
     SETUP_TOKEN_SCOPES,
     _format_usage_lines,
 )
+from tests.test_autoswitch import EngineHarness
 
 
 def _raise_locked(*args, **kwargs):
@@ -12486,3 +12487,261 @@ class TestSessionShellGuardCoversEveryMutator:
         s = self._switcher(sample_sequence_data, monkeypatch)
         with pytest.raises(SwitchError):
             s.unset_alias("2")
+
+
+def _lent_login(access: str = "sk-ant-oat01-lent") -> dict:
+    """A login another computer lent with claude-SAK's token sync (sak.13):
+    an access token alone, as ``api.keep_access_login`` keeps it."""
+    return {"claudeAiOauth": {
+        "accessToken": access,
+        "refreshToken": None,
+        "expiresAt": int((time.time() + 3600) * 1000),
+        "scopes": ["user:profile", "user:inference"],
+        "subscriptionType": "max",
+        "rateLimitTier": "default_claude_max_20x",
+    }}
+
+
+class TestLentDefaultLogin:
+    """sak.13: Claude Code's default login holds an access token another
+    computer lent, for an account claude-swap also has here. It is not this
+    computer's login of that account: never stored, never backed up, never
+    followed as the account's live login, and a switch replaces it."""
+
+    @pytest.fixture
+    def lent(self, temp_home: Path) -> EngineHarness:
+        h = EngineHarness(temp_home)
+        h.seed(1, "a@example.com")
+        h.seed(2, "b@example.com")
+        self._lend(temp_home, "b@example.com", "uuid-2")
+        return h
+
+    @staticmethod
+    def _lend(home: Path, email: str, uuid: str) -> None:
+        (home / ".claude" / ".credentials.json").write_text(json.dumps(_lent_login()))
+        (home / ".claude.json").write_text(json.dumps({
+            "oauthAccount": {"emailAddress": email, "accountUuid": uuid},
+        }))
+
+    @staticmethod
+    def _stored(h: EngineHarness, num: int, email: str) -> dict:
+        return json.loads(h.switcher.read_account_credentials(str(num), email))
+
+    @staticmethod
+    def _live(home: Path) -> dict:
+        return json.loads((home / ".claude" / ".credentials.json").read_text())
+
+    def test_counts_as_unmanaged(self, lent):
+        assert lent.switcher.has_live_login()
+        assert lent.switcher.current_account_number() is None
+        rows = {row[0]: row for row in lent.switcher._build_accounts_info()}
+        assert not any(row[4] for row in rows.values())  # no slot is active
+        assert json.loads(rows[2][5])["claudeAiOauth"]["refreshToken"] == "rt-2"
+
+    def test_a_switch_away_keeps_the_stored_login_and_keeps_no_copy(
+        self, lent, temp_home
+    ):
+        payload = lent.switcher.switch_to("1", json_output=True)
+        assert payload["switched"] is True
+        assert payload["from"]["number"] is None
+        assert self._live(temp_home)["claudeAiOauth"]["refreshToken"] == "rt-1"
+        assert self._stored(lent, 2, "b@example.com") == {
+            "claudeAiOauth": {"accessToken": "sk-2", "refreshToken": "rt-2"},
+        }
+        assert lent.switcher.list_unclaimed_credentials() == {}
+
+    def test_a_switch_to_its_account_puts_that_accounts_login_in(
+        self, lent, temp_home
+    ):
+        payload = lent.switcher.switch_to("2", json_output=True)
+        assert payload["switched"] is True
+        assert self._live(temp_home)["claudeAiOauth"]["refreshToken"] == "rt-2"
+        assert lent.switcher.current_account_number() == "2"
+        assert lent.switcher.list_unclaimed_credentials() == {}
+
+    def test_the_rotation_moves_on_without_backing_it_up(self, lent, temp_home):
+        payload = lent.switcher.switch(json_output=True)
+        assert payload["switched"] is True
+        assert self._live(temp_home)["claudeAiOauth"]["refreshToken"] in {
+            "rt-1", "rt-2",
+        }
+        assert self._stored(lent, 2, "b@example.com")["claudeAiOauth"][
+            "refreshToken"
+        ] == "rt-2"
+
+    def test_a_login_read_past_a_failed_keychain_is_not_replaced(
+        self, lent, temp_home
+    ):
+        degraded = ActiveCredentials(json.dumps(_lent_login()), False, True)
+        before = self._live(temp_home)
+        with patch.object(
+            lent.switcher, "_read_active_credentials", return_value=degraded
+        ), pytest.raises(CredentialReadError, match="nothing was changed"):
+            lent.switcher.switch_to("1", json_output=True)
+        assert self._live(temp_home) == before
+
+    def test_is_never_added(self, lent):
+        with pytest.raises(ValidationError, match="claude /login"):
+            lent.switcher.add_account(slot=None, assume_yes=True)
+        assert self._stored(lent, 2, "b@example.com")["claudeAiOauth"][
+            "refreshToken"
+        ] == "rt-2"
+        assert sorted(lent.switcher._get_sequence_data()["accounts"]) == ["1", "2"]
+
+    def test_status_says_another_computer_lent_it(self, lent, capsys):
+        assert lent.switcher.status(json_output=True) == {
+            "schemaVersion": 1,
+            "active": {
+                "email": "b@example.com", "managed": False, "accessLent": True,
+            },
+        }
+        lent.switcher.status()
+        assert "access lent by another computer" in capsys.readouterr().out
+
+    def test_the_rotation_says_what_to_do_for_an_account_not_managed(
+        self, lent, temp_home
+    ):
+        self._lend(temp_home, "c@example.com", "uuid-3")
+        payload = lent.switcher.switch(json_output=True)
+        assert payload["switched"] is False
+        assert "cswap switch <number>" in payload["message"]
+        with pytest.raises(ConfigError, match="claude /login"):
+            lent.switcher.switch()
+        assert sorted(lent.switcher._get_sequence_data()["accounts"]) == ["1", "2"]
+
+    def test_a_profile_login_of_its_account_is_stored(self, lent, tmp_path):
+        profile = tmp_path / "profile"
+        profile.mkdir()
+        (profile / ".credentials.json").write_text(json.dumps({
+            "claudeAiOauth": {"accessToken": "sk-new", "refreshToken": "rt-new"},
+        }))
+        (profile / ".claude.json").write_text(json.dumps({
+            "oauthAccount": {"emailAddress": "b@example.com", "accountUuid": "uuid-2"},
+        }))
+        slot, created = lent.switcher.add_account_from_profile(str(profile))
+        assert (slot, created) == ("2", False)
+        assert self._stored(lent, 2, "b@example.com")["claudeAiOauth"][
+            "refreshToken"
+        ] == "rt-new"
+
+    def test_a_lent_profile_login_is_never_added(self, lent, tmp_path):
+        profile = tmp_path / "synced"
+        profile.mkdir()
+        (profile / ".credentials.json").write_text(json.dumps(_lent_login("sk-x")))
+        (profile / ".claude.json").write_text(json.dumps({
+            "oauthAccount": {"emailAddress": "c@example.com", "accountUuid": "uuid-3"},
+        }))
+        with pytest.raises(ValidationError, match="another computer"):
+            lent.switcher.add_account_from_profile(str(profile))
+        assert sorted(lent.switcher._get_sequence_data()["accounts"]) == ["1", "2"]
+
+    def test_the_backup_step_never_writes_it_into_a_slot(self, lent):
+        kind, _ = lent.switcher._classify_outgoing_credential(
+            "2", "b@example.com", json.dumps(_lent_login()), {}, {}
+        )
+        assert kind == "lent"
+
+    def test_lent_bytes_past_a_failed_keychain_read_keep_its_account_active(
+        self, lent, temp_home, capsys
+    ):
+        """macOS: the account's own login is in the Keychain item and a stale
+        lent token in the file; the Keychain read failed this pass, so the
+        file's bytes were served (degraded). The slot stays active, so the
+        usage pass defers what would spend the refresh token the live login
+        shares with the slot's stored login (sak.13 review)."""
+        lent.switcher._write_account_credentials("2", "b@example.com", json.dumps({
+            "claudeAiOauth": {
+                "accessToken": "sk-2", "refreshToken": "rt-2", "expiresAt": 1000,
+                "scopes": ["user:profile", "user:inference"],
+            },
+        }))
+        stale = _lent_login("sk-ant-oat01-stale")
+        stale["claudeAiOauth"]["expiresAt"] = 1000
+        (temp_home / ".claude" / ".credentials.json").write_text(json.dumps(stale))
+        degraded = ActiveCredentials(json.dumps(stale), False, True)
+        posted: list[str] = []
+
+        def refresh(creds, timeout_s=10.0):
+            posted.append(json.loads(creds)["claudeAiOauth"]["refreshToken"])
+            return oauth.RefreshOutcome(None, "should not be asked")
+
+        with patch.object(
+            lent.switcher, "_read_active_credentials", return_value=degraded
+        ), patch("claude_swap.oauth.try_refresh_oauth_credentials", refresh), patch(
+            "claude_swap.oauth.request_usage_data", return_value={}
+        ):
+            rows = {row[0]: row for row in lent.switcher._build_accounts_info()}
+            lent.switcher.usage_entries_by_account()
+            payload = lent.switcher.status(json_output=True)
+            lent.switcher.status()
+        assert rows[2][4] is True  # the active slot, as upstream has it
+        assert posted == []
+        assert self._stored(lent, 2, "b@example.com")["claudeAiOauth"][
+            "refreshToken"
+        ] == "rt-2"
+        assert payload["active"]["managed"] is True
+        assert "accessLent" not in payload["active"]
+        assert "access lent by another computer" not in capsys.readouterr().out
+
+
+class TestALiveLoginThatCannotBeReadNow:
+    """sak.13 review: when the default profile is logged in to an account and
+    its login cannot be read cleanly, a profile's login of that account is
+    neither stored nor dropped: whether it would replace the account's own
+    live login cannot be told."""
+
+    @pytest.fixture
+    def own(self, temp_home: Path) -> EngineHarness:
+        h = EngineHarness(temp_home)
+        h.seed(1, "a@example.com")
+        h.seed(2, "b@example.com")
+        live = json.dumps({"claudeAiOauth": {
+            "accessToken": "sk-live", "refreshToken": "rt-live",
+            "expiresAt": 4102444800000, "scopes": ["user:profile", "user:inference"],
+        }})
+        (temp_home / ".claude" / ".credentials.json").write_text(live)
+        (temp_home / ".claude.json").write_text(json.dumps({
+            "oauthAccount": {"emailAddress": "b@example.com", "accountUuid": "uuid-2"},
+        }))
+        h.switcher._write_account_credentials("2", "b@example.com", live)
+        return h
+
+    @staticmethod
+    def _profile(tmp_path: Path) -> Path:
+        profile = tmp_path / "profile"
+        profile.mkdir()
+        (profile / ".credentials.json").write_text(json.dumps({
+            "claudeAiOauth": {"accessToken": "sk-new", "refreshToken": "rt-new"},
+        }))
+        (profile / ".claude.json").write_text(json.dumps({
+            "oauthAccount": {"emailAddress": "b@example.com", "accountUuid": "uuid-2"},
+        }))
+        return profile
+
+    @pytest.mark.parametrize("read", ["degraded", "keychain-unavailable", "error"])
+    def test_a_profile_login_of_its_account_is_refused(
+        self, own, temp_home, tmp_path, read
+    ):
+        live = (temp_home / ".claude" / ".credentials.json").read_text()
+        served = {
+            "degraded": ActiveCredentials(live, False, True),
+            "keychain-unavailable": ActiveCredentials("", True, True),
+            "error": ActiveCredentials(None, False),
+        }[read]
+        profile = self._profile(tmp_path)
+        with patch.object(
+            own.switcher, "_read_active_credentials", return_value=served
+        ), pytest.raises(CredentialReadError, match="cannot be read now"):
+            own.switcher.add_account_from_profile(str(profile))
+        stored = json.loads(own.switcher.read_account_credentials("2", "b@example.com"))
+        assert stored["claudeAiOauth"]["refreshToken"] == "rt-live"
+        assert "rt-new" in (profile / ".credentials.json").read_text()  # kept
+        assert own.switcher.list_unclaimed_credentials() == {}
+
+    def test_after_a_clean_read_it_follows_the_live_login(self, own, tmp_path):
+        slot, created = own.switcher.add_account_from_profile(
+            str(self._profile(tmp_path))
+        )
+        assert (slot, created) == ("2", False)
+        stored = json.loads(own.switcher.read_account_credentials("2", "b@example.com"))
+        assert stored["claudeAiOauth"]["refreshToken"] == "rt-live"

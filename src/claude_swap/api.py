@@ -39,7 +39,7 @@ import threading
 import time
 import unicodedata
 from collections.abc import Callable, Collection, Iterator, Mapping, Sequence
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from datetime import datetime, timedelta, timezone
 from importlib.metadata import version as _dist_version
 from pathlib import Path
@@ -63,13 +63,22 @@ from claude_swap.autoswitch import (
 )
 from claude_swap.claude_locks import (
     CONFIG_STALENESS_S,
+    CREDENTIALS_STALENESS_S,
     STORAGE_WRITE_STALENESS_S,
     claude_config_lock,
     claude_credentials_lock,
     proper_lockfile,
     storage_write_lock_dir,
 )
-from claude_swap.credentials import CLAUDE_CODE_KEYCHAIN_SERVICE, looks_like_api_key
+from claude_swap.credentials import (
+    _ACTIVE_READ_ATTEMPTS,
+    _ACTIVE_READ_RETRY_DELAY,
+    ACCOUNT_CREDENTIAL_KEYS,
+    CLAUDE_CODE_KEYCHAIN_SERVICE,
+    CLAUDE_CODE_MANAGED_KEYCHAIN_SERVICE,
+    CredentialStore,
+    looks_like_api_key,
+)
 from claude_swap.exceptions import (
     AccountNotFoundError,
     ClaudeCodeLockTimeout,
@@ -79,6 +88,7 @@ from claude_swap.exceptions import (
     CredentialReadError,
     CredentialWriteError,
     LockError,
+    MigrationError,
     SessionError,
     SwitchError,
     ValidationError,
@@ -98,6 +108,7 @@ from claude_swap.paths import (
     get_default_claude_config_home,
     get_default_global_config_path,
     get_legacy_backup_root,
+    migrate_legacy_backup_dir,
 )
 from claude_swap.session import (
     AUTH_OVERRIDE_ENV_VARS,
@@ -128,6 +139,7 @@ __all__ = [
     "ConfigWarningEvent",
     "CopiedLogin",
     "CredentialError",
+    "DefaultLoginInfo",
     "ErrorEvent",
     "HandedOver",
     "LockError",
@@ -135,6 +147,7 @@ __all__ = [
     "LoginSource",
     "MovedLogin",
     "NoSwitchEvent",
+    "OwnLoginError",
     "PollEvent",
     "ProjectAccount",
     "ProjectMapping",
@@ -156,7 +169,9 @@ __all__ = [
     "add_setup_token",
     "check_login_source",
     "create_engine",
+    "default_login",
     "forget_access_login",
+    "forget_default_access_login",
     "forget_profile_login",
     "hand_over_login",
     "import_login",
@@ -175,6 +190,7 @@ __all__ = [
     "shared_grants",
     "switch_to",
     "unmap_project",
+    "use_access_login",
     "version",
 ]
 
@@ -418,7 +434,8 @@ def project_account(
 
 
 def active_account(switcher: ClaudeAccountSwitcher) -> str | None:
-    """Slot number of the live default login, or ``None`` when it is unmanaged."""
+    """Slot number of the live default login, or ``None`` when it is unmanaged
+    (an access token another computer lent counts as unmanaged, sak.13)."""
     with _quiet():
         return switcher.current_account_number()
 
@@ -446,8 +463,10 @@ def add_current_login(
     that is already managed is refreshed in its slot; a new one takes the
     next free slot. ``alias`` sets the account's alias (unique). Raises
     :class:`ConfigError` without a live login or from a foreign profile and
-    :class:`ValidationError` for a bad or taken alias or a credential that
-    belongs to another account. Never prompts.
+    :class:`ValidationError` for a bad or taken alias, a credential that
+    belongs to another account, or an access token alone that another
+    computer lent (sak.13: it cannot be renewed here; log in on this computer
+    first). Never prompts.
     """
     _refuse_foreign_profile()
     with _quiet():
@@ -481,8 +500,11 @@ def add_profile_login(
 
     Raises :class:`ConfigError` when the profile has no login or its
     credential belongs to another account, :class:`CredentialError` when the
-    credential is missing or unreadable, and :class:`ValidationError` for a
-    bad or taken alias or an API-key login. Never prompts.
+    credential is missing or unreadable, or when the default profile is
+    logged in to that account and its login cannot be read cleanly now
+    (sak.13: whether to follow it cannot be told, so nothing is stored), and
+    :class:`ValidationError` for a bad or taken alias or an API-key login.
+    Never prompts.
     """
     _refuse_foreign_profile()
     with _quiet():
@@ -693,7 +715,9 @@ def prepare_session_profile(
     extra = _checked_env(extra_env)
     with _quiet():
         account_num, email, org_uuid = switcher.resolve_account(identifier)
-        current = switcher._get_current_account()
+        # A login another computer lent (sak.13) is no copy of this
+        # account's stored login: the profile may hold that one.
+        current = switcher._own_live_identity()
         if current is not None and current == (email, org_uuid):
             raise SessionError(
                 f"Account-{account_num} ({email}) is the active default login; "
@@ -1032,7 +1056,9 @@ def _find_login(
     email: str | None = None
     if identity is not None:
         email, org_uuid = identity
-        current = switcher._get_current_account()
+        # A login another computer lent (sak.13) is not this account's
+        # login here: one moved in is stored for it.
+        current = switcher._own_live_identity()
         data = switcher._get_sequence_data() or {}
         slot = switcher._find_account_slot(data, email, org_uuid) if data else None
         if current == identity:
@@ -1226,7 +1252,9 @@ def import_login(
     :class:`SessionError` when Claude Code cannot run; :class:`CredentialError`
     when it could not move the login (nothing moved then). After the move,
     a failed registration raises :class:`LoginNotAddedError`: ``config_dir``
-    holds the only working copy. The token is never printed or logged.
+    holds the only working copy (also when the default profile is logged in
+    to the moved login's account and that login cannot be read cleanly now,
+    sak.13). The token is never printed or logged.
     """
     _refuse_foreign_profile()
     extra = _checked_env(extra_env)
@@ -1240,8 +1268,8 @@ def import_login(
     with _quiet():
         try:
             identity = _profile_identity(Path(target))
-            default_login = (
-                identity is not None and switcher._get_current_account() == identity
+            default_login = identity is not None and switcher._live_login_followed_for(
+                *identity
             )
             slot, created = switcher.add_account_from_profile(target, alias=alias)
             email = switcher.account_email(slot)
@@ -1481,7 +1509,7 @@ def _copy_target(
             f"Account {slot} ({email}) runs on a setup-token: it takes a new "
             "setup-token instead of a login."
         )
-    if switcher._get_current_account() == (email, org_uuid):
+    if switcher._own_live_identity() == (email, org_uuid):
         raise _default_login_refusal(slot, email)
     return slot, email, org_uuid
 
@@ -1515,7 +1543,7 @@ def _refuse_other_login(
     owner, owner_org, owner_org_name = identity
     data = switcher._get_sequence_data() or {}
     if switcher._find_account_slot(data, owner, owner_org) == slot:
-        if switcher._get_current_account() == (email, org_uuid):
+        if switcher._own_live_identity() == (email, org_uuid):
             raise _default_login_refusal(slot, email)
         return
     whose = owner
@@ -1671,7 +1699,9 @@ def add_login_copy(
     for a bare token, an API key, a setup-token, a logged-out or expired
     login, one without its scopes, or a bad alias or one another account
     uses; :class:`CredentialError` when the file cannot be read, the login
-    cannot be renewed, or Anthropic does not say whose it is. With
+    cannot be renewed, Anthropic does not say whose it is, or the default
+    profile is logged in to its account and that login cannot be read
+    cleanly now (sak.13). With
     ``account`` also :class:`AccountNotFoundError`, :class:`ConfigError` for
     the default login's account, the login it has already or an alias, and
     :class:`ValidationError` for an account of another kind or another
@@ -1716,7 +1746,7 @@ def add_login_copy(
         with _quiet():
             if wanted is not None:
                 _refuse_other_login(switcher, wanted, identity, where, renewed)
-            default_login = switcher._get_current_account() == identity[:2]
+            default_login = switcher._live_login_followed_for(*identity[:2])
             slot, created = switcher.add_account_from_profile(target, alias=alias)
             email = switcher.account_email(slot)
     except ClaudeSwitchError as e:
@@ -1804,7 +1834,7 @@ def _handover_refusal(
             f"Account {slot} ({email}) runs on a setup-token, not a login; add "
             "the setup-token where it is needed instead."
         )
-    if switcher._get_current_account() == (email, org_uuid):
+    if switcher._own_live_identity() == (email, org_uuid):
         return ConfigError(
             f"Account {slot} ({email}) is the account Claude Code's default "
             "profile is logged in to; switch to another account first."
@@ -2326,6 +2356,8 @@ def _confirm_live(
     active = switcher._read_active_credentials()
     if not active.value or active.degraded or active.keychain_unavailable:
         return
+    if oauth.is_lent_login(active.value):
+        return  # another computer lent it (sak.13): nothing to confirm
     _attribute_live(switcher, slot, email, org_uuid, active.value)
 
 
@@ -2639,7 +2671,10 @@ def access_token(
     # it waits for locks and the network, and every other call of this
     # module waits for that lock.
     with _account_locks(switcher, slot):
-        if switcher._live_identity_matches(email, org_uuid):
+        # A default login another computer lent (sak.13) is not this
+        # account's login here: the stored login is the newest one then.
+        live = switcher._live_identity_matches(email, org_uuid)
+        if live and not switcher._live_login_is_lent():
             login, renewed = _live_token(switcher, slot, email, org_uuid, window_ms)
         else:
             login, renewed = _stored_token(switcher, slot, email, org_uuid, window_ms)
@@ -2754,15 +2789,30 @@ def _profile_lock(
         yield
 
 
+def _read_keychain(service: str) -> str | None:
+    """One Keychain item of this user (``None`` when there is none), with the
+    bounded retry of claude-swap's active read (``_ACTIVE_READ_ATTEMPTS``
+    tries, ``_ACTIVE_READ_RETRY_DELAY`` apart): a transient lock or timeout
+    of ``security`` is ridden out; the last error is raised."""
+    account = macos_keychain.keychain_account_name()
+    attempt = 1
+    while True:
+        try:
+            return macos_keychain.get_password(service, account)
+        except macos_keychain.KEYCHAIN_ERRORS:
+            if attempt >= _ACTIVE_READ_ATTEMPTS:
+                raise
+        attempt += 1
+        time.sleep(_ACTIVE_READ_RETRY_DELAY)
+
+
 def _profile_item(raw: str) -> str | None:
     """The profile's own Keychain item (macOS), which Claude Code reads
     before its ``.credentials.json``; ``None`` when there is none."""
     if Platform.detect() != Platform.MACOS:
         return None
     try:
-        return macos_keychain.get_password(
-            keychain_service_name(raw), macos_keychain.keychain_account_name()
-        )
+        return _read_keychain(keychain_service_name(raw))
     except macos_keychain.KEYCHAIN_ERRORS as e:
         raise CredentialReadError(
             f"The Keychain item of the profile {raw} cannot be read now (locked or "
@@ -2836,15 +2886,16 @@ def _sweep_temporaries(path: Path) -> None:
 
 def _write_private(path: Path, text: str) -> None:
     """Replace ``path`` with ``text`` in one step, readable by its owner only,
-    on the disk (its folder's entry too) before this returns. The temporary
-    copy never outlives the call; one a dead process left behind goes with
+    on the disk (its folder's entry too) before this returns; line ends are
+    written as ``text`` has them, on every system. The temporary copy never
+    outlives the call; one a dead process left behind goes with
     :func:`_sweep_temporaries`."""
     temporary: str | None = None
     try:
         fd, temporary = tempfile.mkstemp(
             dir=path.parent, prefix=_temporary_prefix(path), suffix=_TEMPORARY_SUFFIX
         )
-        with os.fdopen(fd, "w", encoding="utf-8") as f:
+        with os.fdopen(fd, "w", encoding="utf-8", newline="") as f:
             f.write(text)
             f.flush()
             sync_file(f.fileno())
@@ -3081,3 +3132,882 @@ def forget_access_login(config_dir: str | os.PathLike[str]) -> None:
         if item is not None:
             _remove_profile_item(raw)
             _touch_newer(target)
+
+
+# -- Claude Code's default login on a device (sak.13) -------------------------------
+
+DEFAULT_LOGIN_LOCK_TIMEOUT = 15.0
+"""How long :func:`use_access_login` and :func:`forget_default_access_login`
+wait for claude-swap's own lock: a switch holds it for its local writes."""
+
+
+@dataclass(frozen=True, slots=True)
+class DefaultLoginInfo:
+    """What Claude Code's default profile is signed in with now
+    (:func:`default_login`, sak.13). Never a token."""
+
+    kind: str
+    """``"none"``: no login. ``"access"``: an access token alone (no
+    refresh token, its expiry recorded, not a setup-token) of an account
+    that is none of claude-swap's accounts here: what
+    :func:`use_access_login` puts there. ``"own"``: a login of this
+    computer's own: a refresh token (someone logged in here, or one of
+    claude-swap's accounts is active), a setup-token, an access token
+    without its expiry, or an access token alone of one of claude-swap's
+    accounts here. ``"api_key"``: a managed API key."""
+    email: str | None
+    """Its account (``~/.claude.json`` ``oauthAccount``), when known; never
+    for ``"none"`` or ``"api_key"``."""
+    organization_uuid: str | None
+    expires_at: str | None
+    """ISO 8601 UTC, when the login records it: for ``"access"`` when its
+    access token lapses (the login stops working then), for ``"own"`` when
+    the login itself lapses."""
+    leftover_access: bool = False
+    """For ``"own"`` and ``"api_key"``: one of the two stores still holds an
+    access token alone as :func:`use_access_login` writes it, next to the
+    computer's own login or API key: a leftover
+    :func:`forget_default_access_login` removes (a stale
+    ``.credentials.json`` next to an own login in the Keychain item, or a
+    Keychain item hiding an own login in the file from Claude Code, also when
+    it keeps an MCP server's login besides)."""
+
+
+class OwnLoginError(ConfigError):
+    """Claude Code's default profile holds a login of its own (a refresh
+    token: someone logged in there, or claude-swap's own account; a
+    setup-token; an access token alone of one of claude-swap's accounts
+    here) or a managed API key: it is never replaced or removed for an
+    access-only login (sak.13)."""
+
+
+def _parsed(text: str | None) -> object:
+    """``text`` as Claude Code parses a store of its credentials; ``None``
+    when the store holds nothing it can read (none, empty, not JSON)."""
+    if text is None or not text.strip():
+        return None
+    try:
+        return json.loads(text)
+    except ValueError:
+        return None
+
+
+def _login_kind(text: str | None) -> str:
+    """What one store of Claude Code's credentials holds, as
+    :class:`DefaultLoginInfo` names it. An empty store, ``{}``, what Claude
+    Code keeps besides a login (an MCP server's login) and an emptied login
+    hold none."""
+    if text is None:
+        return "none"
+    if looks_like_api_key(text):
+        return "api_key"
+    entry = _oauth_entry(text)
+    if entry is None:
+        return "none"
+    refresh = entry.get("refreshToken")
+    if isinstance(refresh, str) and refresh.strip():
+        return "own"
+    access = entry.get("accessToken")
+    if not isinstance(access, str) or not access.strip():
+        return "none"
+    return "access" if oauth.is_access_only_login(text) else "own"
+
+
+@dataclass(frozen=True)
+class _DefaultStores:
+    """What Claude Code's default profile holds now, store by store."""
+
+    item: str | None
+    """Its macOS Keychain item; ``None`` when there is none (or no Keychain)."""
+    file: str | None
+    """Its ``.credentials.json``; ``None`` when there is none."""
+    api_key: bool
+    """A managed API key is set (the ``Claude Code`` Keychain item, or
+    ``primaryApiKey``)."""
+    config: dict[str, Any] | None
+    """``~/.claude.json``; ``None`` when there is none, or it is broken."""
+    config_broken: bool
+    """``~/.claude.json`` is there but holds no JSON object."""
+    managed: bool = False
+    """The account ``~/.claude.json`` records is one of claude-swap's
+    accounts here (:func:`_claude_swap_slot`; looked up only when a store
+    holds an access token alone)."""
+
+    @property
+    def effective(self) -> str | None:
+        """What Claude Code reads its login from: the Keychain item when it
+        holds JSON, else the file (an empty item does not hide the file)."""
+        return self.item if _parsed(self.item) is not None else self.file
+
+    @property
+    def account(self) -> dict[str, Any]:
+        """The account ``~/.claude.json`` records (``oauthAccount``); empty
+        when it records none."""
+        account = (self.config or {}).get("oauthAccount")
+        return cast(dict[str, Any], account) if isinstance(account, dict) else {}
+
+    @property
+    def kind(self) -> str:
+        """The default profile's login, as :class:`DefaultLoginInfo` names
+        it. A login of its own in either store counts, also one Claude Code
+        does not read now: a write would replace it there. So does an access
+        token alone of one of claude-swap's accounts here: that account's
+        login of this computer's own."""
+        stores = tuple(
+            "own" if kind == "access" and self.managed else kind
+            for kind in (_login_kind(self.item), _login_kind(self.file))
+        )
+        if "own" in stores:
+            return "own"
+        if self.api_key or "api_key" in stores:
+            return "api_key"
+        return "access" if _login_kind(self.effective) == "access" else "none"
+
+
+def _leftover_stores(stores: _DefaultStores) -> tuple[str, ...]:
+    """The stores (``"item"``, ``"file"``) that hold an access token alone
+    as :func:`use_access_login` writes it (:func:`oauth.is_lent_login`)
+    next to a login of the computer's own in the other store, or a managed
+    API key: leftovers no login of this computer depends on. An access
+    token alone that is itself the reason for ``"own"`` (one of
+    claude-swap's accounts here) is none."""
+    own_item = _login_kind(stores.item) in ("own", "api_key")
+    own_file = _login_kind(stores.file) in ("own", "api_key")
+    held = (
+        ("item", stores.item, own_file or stores.api_key),
+        ("file", stores.file, own_item or stores.api_key),
+    )
+    return tuple(
+        name for name, text, beside in held if beside and oauth.is_lent_login(text)
+    )
+
+
+def _read_if_there(path: Path) -> str | None:
+    """The file's text as it is written, its line ends too; ``None`` when
+    there is no such file."""
+    try:
+        with path.open(encoding="utf-8", newline="") as f:
+            return f.read()
+    except FileNotFoundError:
+        return None
+    except (OSError, ValueError) as e:
+        raise CredentialReadError(f"Cannot read {path} now: {e}") from e
+
+
+def _default_item(service: str) -> str | None:
+    """One of Claude Code's Keychain items of the default profile; ``None``
+    when there is none."""
+    try:
+        return _read_keychain(service)
+    except macos_keychain.KEYCHAIN_ERRORS as e:
+        raise CredentialReadError(
+            "Claude Code's default login in the Keychain cannot be read now (the "
+            f"Keychain is locked or busy); unlock it and try again: {e}"
+        ) from e
+
+
+def _default_credentials_path() -> Path:
+    return get_default_claude_config_home() / ".credentials.json"
+
+
+def _claude_swap_root() -> Path:
+    """claude-swap's store, with a legacy store moved to it first (Linux and
+    WSL), as opening claude-swap moves it (``ClaudeAccountSwitcher``): a lock
+    or a read here never leaves the new store beside an unmoved legacy one,
+    which every later opening would refuse."""
+    root = get_backup_root()
+    try:
+        migrate_legacy_backup_dir(root)
+    except MigrationError as e:
+        raise ConfigError(
+            f"claude-swap's store cannot be used now: {e}"
+        ) from e
+    return root
+
+
+def _claude_swap_slot(account: Mapping[str, Any]) -> str | None:
+    """Which of claude-swap's accounts here ``account`` (an ``oauthAccount``)
+    is, matched as :meth:`ClaudeAccountSwitcher.current_account_number`
+    matches the live login (email and organization); ``None`` for none.
+    claude-swap's account list is only read: one that cannot be read now is
+    refused (:class:`ConfigError`), never taken for no accounts."""
+    email = account.get("emailAddress")
+    if not isinstance(email, str) or not email:
+        return None
+    path = _claude_swap_root() / "sequence.json"
+    try:
+        text = path.read_text(encoding="utf-8")
+    except FileNotFoundError:
+        return None
+    except (OSError, ValueError) as e:
+        raise ConfigError(
+            f"claude-swap's account list {path} cannot be read now ({e}), so it "
+            "cannot be told whether Claude Code's default login is one of its "
+            "accounts; try again in a moment."
+        ) from e
+    data = _parsed(text)
+    accounts = data.get("accounts", {}) if isinstance(data, dict) else None
+    if not isinstance(accounts, dict) or not all(
+        isinstance(record, dict) for record in accounts.values()
+    ):
+        raise ConfigError(
+            f"claude-swap's account list {path} could not be parsed, so it cannot "
+            "be told whether Claude Code's default login is one of its accounts. "
+            "Repair or move the file, then try again."
+        )
+    organization = account.get("organizationUuid", "") or ""
+    return ClaudeAccountSwitcher._find_account_slot(
+        cast(dict[str, Any], data), email, organization
+    )
+
+
+def _read_default_stores() -> _DefaultStores:
+    """What Claude Code's default profile holds, read where Claude Code
+    opened by hand reads it; what cannot be read now is refused
+    (:class:`CredentialReadError`, :class:`ConfigError`), never taken for
+    empty. For an access token alone, claude-swap's account list tells
+    whether its account is one of claude-swap's here."""
+    item: str | None = None
+    api_key = False
+    if Platform.detect() == Platform.MACOS:
+        item = _default_item(CLAUDE_CODE_KEYCHAIN_SERVICE)
+        managed = _default_item(CLAUDE_CODE_MANAGED_KEYCHAIN_SERVICE)
+        api_key = bool(managed and managed.strip())
+    file = _read_if_there(_default_credentials_path())
+    text = _read_if_there(get_default_global_config_path())
+    config: dict[str, Any] | None = None
+    broken = False
+    if text is not None:
+        loaded = _parsed(text) if text.strip() else {}
+        if isinstance(loaded, dict):
+            config = cast(dict[str, Any], loaded)
+        else:
+            broken = True
+    key = (config or {}).get("primaryApiKey")
+    api_key = api_key or (isinstance(key, str) and bool(key.strip()))
+    stores = _DefaultStores(
+        item=item, file=file, api_key=api_key, config=config, config_broken=broken
+    )
+    if stores.kind in ("own", "api_key") or "access" not in (
+        _login_kind(item),
+        _login_kind(file),
+    ):
+        return stores
+    return replace(stores, managed=_claude_swap_slot(stores.account) is not None)
+
+
+def _instant_or_none(epoch_ms: object) -> str | None:
+    """Epoch milliseconds as :func:`_instant` gives them; ``None`` for what
+    is no time."""
+    if isinstance(epoch_ms, bool) or not isinstance(epoch_ms, (int, float)):
+        return None
+    try:
+        return _instant(int(epoch_ms))
+    except (OverflowError, ValueError):
+        return None
+
+
+def _login_lapse(credentials: str) -> str | None:
+    """When the login itself lapses (:func:`login_expires_at_iso`); ``None``
+    for a value that is no time."""
+    try:
+        return login_expires_at_iso(credentials)
+    except (OverflowError, OSError, ValueError):
+        return None
+
+
+def _default_info(stores: _DefaultStores) -> DefaultLoginInfo:
+    kind = stores.kind
+    leftover = bool(_leftover_stores(stores))
+    if kind not in ("access", "own"):
+        return DefaultLoginInfo(
+            kind=kind,
+            email=None,
+            organization_uuid=None,
+            expires_at=None,
+            leftover_access=leftover,
+        )
+    held = (stores.effective, stores.item, stores.file)
+    own = next((t for t in held if _login_kind(t) == "own"), None)
+    if own is not None:
+        expires = _login_lapse(own)
+    else:  # an access token alone: the login lapses with it
+        alone = next((t for t in held if _login_kind(t) == "access"), None)
+        entry = _oauth_entry(alone or "") or {}
+        expires = _instant_or_none(entry.get("expiresAt"))
+    account = stores.account
+    return DefaultLoginInfo(
+        kind=kind,
+        email=_text(account.get("emailAddress")),
+        organization_uuid=_text(account.get("organizationUuid")),
+        expires_at=expires,
+        leftover_access=leftover,
+    )
+
+
+def _refuse_other_store() -> None:
+    """Read and write only where Claude Code opened by hand keeps its login,
+    as :func:`access_token` refuses anything else."""
+    _refuse_foreign_profile()
+    if os.environ.get("CLAUDE_SECURESTORAGE_CONFIG_DIR"):
+        raise ConfigError(_UNMIRRORED)
+
+
+def default_login() -> DefaultLoginInfo:
+    """What Claude Code's default profile is signed in with now (sak.13):
+    the login Claude Code opened by hand uses (``claude`` in a terminal, an
+    editor's Claude agent). Changes nothing (but for moving a legacy store
+    on Linux/WSL, as opening claude-swap does) and carries no token.
+
+    Read where Claude Code reads it: on macOS the Keychain item ``Claude
+    Code-credentials`` first, then ``~/.claude/.credentials.json``, and a
+    managed API key after both; the account from ``~/.claude.json``
+    (``oauthAccount``). An empty store, one that holds ``{}`` or only what
+    Claude Code keeps besides a login (an MCP server's login), and an
+    emptied login read as ``"none"``. An access token alone in the store
+    Claude Code reads (no refresh token: null, missing or ``""``; its
+    ``expiresAt`` recorded; not a setup-token's scopes) reads as
+    ``"access"``, unless its account is one of claude-swap's accounts here
+    (as :meth:`ClaudeAccountSwitcher.current_account_number` matches the
+    live login: email and organization), which makes it that account's
+    login and ``"own"``. A login with a refresh token, a setup-token, or an
+    access token without its ``expiresAt`` reads as ``"own"``, in either
+    store (a write would replace it there too); a managed API key as
+    ``"api_key"``. ``leftover_access`` says when an access token alone is
+    left in one store next to such a login or key
+    (:func:`forget_default_access_login` removes it). Each Keychain read
+    rides out a transient failure with claude-swap's bounded retry.
+
+    Raises :class:`CredentialReadError` when a store cannot be read now (a
+    locked Keychain) and :class:`ConfigError` with a foreign
+    ``CLAUDE_CONFIG_DIR`` or ``CLAUDE_SECURESTORAGE_CONFIG_DIR`` set, or
+    when claude-swap's account list cannot be read for an access token
+    alone. Never prompts.
+    """
+    _refuse_other_store()
+    return _default_info(_read_default_stores())
+
+
+@contextlib.contextmanager
+def _default_login_locks() -> Iterator[None]:
+    """Hold, in claude-swap's order, claude-swap's own lock (every switch
+    holds it), Claude Code's credential locks of the default profile (its
+    renewals hold them), its storage-write lock (its other changes of the
+    login, such as an MCP server's login) and the lock of
+    ``~/.claude.json``: no switch, renewal or write of Claude Code's comes
+    in between."""
+    store = _claude_swap_root()
+    own = FileLock(store / ".lock", timeout=DEFAULT_LOGIN_LOCK_TIMEOUT)
+    try:
+        store.mkdir(mode=0o700, parents=True, exist_ok=True)
+        taken = own.acquire()
+    except OSError as e:
+        raise LockError(f"claude-swap's own lock cannot be taken: {e}") from e
+    if not taken:
+        raise LockError(
+            "claude-swap is switching Claude Code's default login right now; try "
+            "again in a moment."
+        )
+    home = get_default_claude_config_home()
+    config = get_default_global_config_path()
+    # Claude Code's two credential locks in its own order, then its
+    # storage-write lock (its renewal takes them so), then ~/.claude.json's.
+    locks = (
+        (home / ".oauth_refresh.lock", CREDENTIALS_STALENESS_S, "its login"),
+        (home.with_name(f"{home.name}.lock"), CREDENTIALS_STALENESS_S, "its login"),
+        (storage_write_lock_dir(home), STORAGE_WRITE_STALENESS_S, "its login"),
+        (config.with_name(f"{config.name}.lock"), CONFIG_STALENESS_S, str(config)),
+    )
+    try:
+        with contextlib.ExitStack() as held:
+            for lock_dir, staleness, what in locks:
+                held.enter_context(_profile_lock(lock_dir, staleness, what))
+            yield
+    finally:
+        own.release()
+
+
+def _refuse_own_default(stores: _DefaultStores) -> None:
+    """A login of this computer's own, or a managed API key, is never
+    replaced or removed (:class:`OwnLoginError`)."""
+    kind = stores.kind
+    if kind == "own":
+        raise OwnLoginError(
+            "Claude Code's default login on this computer is signed in on its own "
+            "(someone logged in here, or one of claude-swap's own accounts is in "
+            "use), so it is left as it is; nothing was changed."
+        )
+    if kind == "api_key":
+        raise OwnLoginError(
+            "Claude Code's default login on this computer uses an API key of its "
+            "own, so it is left as it is; nothing was changed."
+        )
+
+
+def _refuse_broken_config(stores: _DefaultStores) -> None:
+    """``~/.claude.json`` carries all of Claude Code's state: one that cannot
+    be read is never written over."""
+    if stores.config_broken:
+        raise ConfigError(
+            f"{get_default_global_config_path()} is not a file Claude Code can read "
+            "(it holds no JSON object), so the account cannot be recorded there; "
+            "nothing was changed. Repair or move the file, then try again."
+        )
+
+
+def _refuse_claude_swap_account(account: Mapping[str, Any]) -> None:
+    """An access token alone of one of claude-swap's accounts here never goes
+    into the default profile: :func:`default_login` would read it as that
+    account's login of this computer's own, so it could not be replaced or
+    removed again; claude-swap's own login of that account is the one to
+    use here (``cswap switch``)."""
+    slot = _claude_swap_slot(account)
+    if slot is not None:
+        raise ConfigError(
+            f"{account.get('emailAddress')} is account {slot} of claude-swap on this "
+            "computer, so Claude Code's default login here uses claude-swap's own "
+            f"login of it (`cswap switch {slot}`), not one another computer sent; "
+            "nothing was changed."
+        )
+
+
+def _profile_account(directory: Path) -> dict[str, Any] | None:
+    """The account a profile's ``.claude.json`` records (``oauthAccount``,
+    as Claude Code resolves the file); ``None`` without one."""
+    legacy = directory / ".config.json"
+    path = legacy if legacy.exists() else directory / ".claude.json"
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return None
+    account = data.get("oauthAccount") if isinstance(data, dict) else None
+    if not isinstance(account, dict) or not _text(account.get("emailAddress")):
+        return None
+    return cast(dict[str, Any], account)
+
+
+def _lent_login(raw: str) -> tuple[dict[str, Any], dict[str, Any]]:
+    """The access-only login the profile ``raw`` holds (as Claude Code reads
+    it there, under the profile's storage-write lock) with ``refreshToken``
+    null, and the account it records; refuses anything else
+    (:class:`ConfigError`) before anything is written. What goes into the
+    default profile is a login claude-swap tells for lent
+    (:func:`oauth.is_lent_login`), so it never stores or backs it up."""
+    path = Path(raw)
+    if not path.is_dir():
+        raise ConfigError(f"The profile {raw} does not exist, so it holds no login.")
+    with _profile_lock(
+        storage_write_lock_dir(path), STORAGE_WRITE_STALENESS_S, f"the login of {raw}"
+    ):
+        item = _profile_item(raw)
+        text = item if _parsed(item) is not None else _read_if_there(
+            path / ".credentials.json"
+        )
+    entry = dict(_oauth_entry(text or "") or {})
+    entry["refreshToken"] = None
+    if _login_kind(text) != "access" or not oauth.is_lent_login(
+        json.dumps({"claudeAiOauth": entry})
+    ):
+        raise ConfigError(
+            f"The profile {raw} holds no login on an access token alone with its "
+            "scopes (it holds none, one with a refresh token, or one without its "
+            "scopes), so it cannot be used; nothing was changed."
+        )
+    account = _profile_account(path)
+    if account is None:
+        raise ConfigError(
+            f"The profile {raw} does not record whose login it holds (no "
+            "oauthAccount in its .claude.json); nothing was changed."
+        )
+    return entry, account
+
+
+def _held_login(stores: _DefaultStores) -> dict[str, Any] | None:
+    """The login Claude Code reads in the default profile, with a refresh
+    token that is missing or ``""`` written as null."""
+    entry = _oauth_entry(stores.effective or "")
+    if entry is None:
+        return None
+    held = dict(entry)
+    refresh = held.get("refreshToken")
+    if not isinstance(refresh, str) or not refresh.strip():
+        held["refreshToken"] = None
+    return held
+
+
+def _with_login(stores: _DefaultStores, entry: Mapping[str, Any]) -> str:
+    """The default profile's credentials with ``entry`` as their login: what
+    Claude Code keeps there besides a login (an MCP server's login, a
+    plugin's secrets) stays; what belongs to another login (its device
+    enrollment) does not."""
+    base = _parsed(stores.effective)
+    kept: dict[str, Any] = {}
+    if isinstance(base, dict):
+        kept = {
+            key: value
+            for key, value in cast(dict[str, Any], base).items()
+            if key not in ACCOUNT_CREDENTIAL_KEYS
+        }
+    kept["claudeAiOauth"] = dict(entry)
+    return json.dumps(kept)
+
+
+class _DefaultProfileHost:
+    """What :class:`CredentialStore` reads of a switcher, for writing Claude
+    Code's default login as a switch writes it: no account store is
+    opened."""
+
+    def __init__(self) -> None:
+        self.platform = Platform.detect()
+        self.credentials_dir = get_backup_root() / "credentials"
+        self._logger = _logger
+
+
+def _write_default_login(credentials: str) -> None:
+    """Write Claude Code's default login where a switch writes it: on macOS
+    the Keychain item when it takes it, and an existing
+    ``.credentials.json`` too, so running sessions read it again; else the
+    file, with any stale Keychain item removed. The caller holds
+    :func:`_default_login_locks`."""
+    CredentialStore(_DefaultProfileHost())._write_oauth_credentials(credentials)
+
+
+def _put_back(stores: _DefaultStores) -> None:
+    """Best effort: put back what Claude Code's default profile held before
+    a write that could not be finished."""
+    try:
+        if Platform.detect() == Platform.MACOS:
+            account = macos_keychain.keychain_account_name()
+            if stores.item is None:
+                macos_keychain.delete_password(CLAUDE_CODE_KEYCHAIN_SERVICE, account)
+            else:
+                macos_keychain.set_password(
+                    CLAUDE_CODE_KEYCHAIN_SERVICE, account, stores.item
+                )
+        path = _default_credentials_path()
+        if stores.file is None:
+            path.unlink(missing_ok=True)
+        else:
+            _write_private(path, stores.file)
+    except (ClaudeSwitchError, *macos_keychain.KEYCHAIN_ERRORS) as e:
+        _logger.warning(
+            "api: Claude Code's default login could not be put back as it was: %s", e
+        )
+
+
+def _write_default_config(config: Mapping[str, Any]) -> None:
+    """Replace ``~/.claude.json`` with ``config`` in one step (through a
+    symlink, never over it), owner-only, as a switch writes it. The caller
+    holds its lock (:func:`_default_login_locks`)."""
+    path = get_default_global_config_path()
+    target = Path(os.path.realpath(path)) if path.is_symlink() else path
+    _sweep_temporaries(target)
+    _write_private(target, json.dumps(config, indent=2))
+
+
+def _record_default_account(stores: _DefaultStores, account: Mapping[str, Any]) -> bool:
+    """Record whose login the default profile holds in ``~/.claude.json``:
+    ``oauthAccount``, merged as :func:`keep_access_login` merges it (what
+    Claude Code recorded about the same account stays), and
+    ``hasCompletedOnboarding``; nothing else changes. Whether it wrote."""
+    config = dict(stores.config or {})
+    given = {key: value for key, value in account.items() if value is not None}
+    current = config.get("oauthAccount")
+    same = (
+        isinstance(current, dict)
+        and current.get("emailAddress") == given.get("emailAddress")
+        and (current.get("organizationUuid") or None)
+        == (given.get("organizationUuid") or None)
+    )
+    merged = {**current, **given} if same and isinstance(current, dict) else given
+    if current == merged and config.get("hasCompletedOnboarding") is True:
+        return False
+    config["oauthAccount"] = merged
+    config["hasCompletedOnboarding"] = True
+    _write_default_config(config)
+    return True
+
+
+def use_access_login(config_dir: str | os.PathLike[str]) -> bool:
+    """Sign Claude Code's default profile in with the access-only login the
+    profile ``config_dir`` holds (sak.13): one :func:`keep_access_login`
+    keeps (its ``claudeAiOauth`` with ``refreshToken`` null, and its
+    ``.claude.json`` ``oauthAccount``), so that Claude Code opened by hand
+    on this computer uses that account. Another access-only login there is
+    replaced (that is a switch); a running Claude Code takes the new one at
+    its next request.
+
+    The login is written where ``cswap switch`` writes the default login: on
+    macOS the Keychain item ``Claude Code-credentials`` when it takes it,
+    and an existing ``~/.claude/.credentials.json`` too, so running sessions
+    read it again; else that file, with any stale Keychain item removed.
+    What Claude Code keeps there besides a login (an MCP server's login, a
+    plugin's secrets) stays; an empty item, or one with only those, is
+    replaced in place. ``~/.claude.json`` gets the account (``oauthAccount``,
+    merged as :func:`keep_access_login` merges it) and
+    ``hasCompletedOnboarding``; nothing else there changes. All of it under
+    claude-swap's own lock, Claude Code's credential locks of the default
+    profile, its storage-write lock and the lock of ``~/.claude.json``, and
+    the source profile's storage-write lock while it is read. If the
+    account cannot be recorded, the login is put back as it was (best
+    effort) and the error is raised.
+
+    Returns False when the default profile held that very login already
+    (and its account), True when it wrote. Raises :class:`OwnLoginError`
+    before anything is written when the default profile holds a login of
+    its own (``"own"`` in :func:`default_login`: a refresh token, a
+    setup-token or an access token without its expiry in either store, or
+    an access token alone of one of claude-swap's accounts here) or a
+    managed API key, which is never touched; :class:`ConfigError` when
+    ``config_dir`` is the default profile, claude-swap's store, inside or
+    above them, not a full path, or holds no access-only login or no
+    account, when that account is one of claude-swap's accounts here (its
+    own login of it is the one to use), when ``~/.claude.json`` or
+    claude-swap's account list cannot be read, and with a foreign
+    ``CLAUDE_CONFIG_DIR`` or ``CLAUDE_SECURESTORAGE_CONFIG_DIR``;
+    :class:`CredentialReadError` when a store cannot be read now (a locked
+    Keychain); :class:`CredentialWriteError` when the login or the account
+    cannot be written; :class:`LockError` while Claude Code or a switch
+    holds a lock. Never prompts; the token is never printed or logged.
+    """
+    _refuse_other_store()
+    raw = _access_profile(config_dir)
+    with _default_login_locks():
+        entry, account = _lent_login(raw)
+        stores = _read_default_stores()
+        _refuse_own_default(stores)
+        _refuse_broken_config(stores)
+        _refuse_claude_swap_account(account)
+        wrote = _held_login(stores) != entry
+        if wrote:
+            _write_default_login(_with_login(stores, entry))
+        try:
+            recorded = _record_default_account(stores, account)
+        except BaseException:
+            if wrote:
+                _put_back(stores)
+            raise
+    if wrote or recorded:
+        _logger.debug("api: Claude Code's default login now uses the login of %s", raw)
+    return wrote or recorded
+
+
+def _without_login(text: str) -> dict[str, Any]:
+    """What a store of Claude Code's credentials keeps besides its login."""
+    data = _parsed(text)
+    if not isinstance(data, dict):
+        return {}
+    return {
+        key: value
+        for key, value in cast(dict[str, Any], data).items()
+        if key != "claudeAiOauth"
+    }
+
+
+def _forget_in_item(text: str) -> None:
+    """Remove the login from the default profile's Keychain item; the item
+    goes when nothing else is left in it."""
+    kept = _without_login(text)
+    account = macos_keychain.keychain_account_name()
+    try:
+        if kept:
+            macos_keychain.set_password(
+                CLAUDE_CODE_KEYCHAIN_SERVICE, account, json.dumps(kept)
+            )
+        else:
+            macos_keychain.delete_password(CLAUDE_CODE_KEYCHAIN_SERVICE, account)
+    except macos_keychain.KEYCHAIN_ERRORS as e:
+        raise CredentialWriteError(
+            f"Could not remove the login from Claude Code's Keychain item: {e}"
+        ) from e
+
+
+def _forget_in_file(text: str) -> None:
+    """Remove the login from the default profile's ``.credentials.json``;
+    the file goes when nothing else is left in it."""
+    path = _default_credentials_path()
+    kept = _without_login(text)
+    if kept:
+        _sweep_temporaries(path)
+        _write_private(path, json.dumps(kept))
+        return
+    try:
+        path.unlink(missing_ok=True)
+    except OSError as e:
+        raise CredentialWriteError(f"Could not remove {path}: {e}") from e
+
+
+def _skip_whitespace(text: str, index: int) -> int:
+    """The first position at or after ``index`` that is not JSON whitespace."""
+    while index < len(text) and text[index] in " \t\n\r":
+        index += 1
+    return index
+
+
+def _written_values(text: str) -> dict[str, tuple[Any, str]]:
+    """The top-level values of the JSON object ``text`` by key, each with the
+    text it is written as there; a key written twice holds its last value, as
+    :func:`json.loads` reads it. Raises ValueError when ``text`` is not one
+    JSON object."""
+    decoder = json.JSONDecoder()
+    values: dict[str, tuple[Any, str]] = {}
+    index = _skip_whitespace(text, 0)
+    if not text.startswith("{", index):
+        raise ValueError("not a JSON object")
+    index = _skip_whitespace(text, index + 1)
+    more = not text.startswith("}", index)
+    while more:
+        key, index = decoder.raw_decode(text, index)
+        index = _skip_whitespace(text, index)
+        if not isinstance(key, str) or not text.startswith(":", index):
+            raise ValueError("not a JSON object")
+        start = _skip_whitespace(text, index + 1)
+        value, end = decoder.raw_decode(text, start)
+        values[key] = (value, text[start:end])
+        index = _skip_whitespace(text, end)
+        more = text.startswith(",", index)
+        if more:
+            index = _skip_whitespace(text, index + 1)
+        elif not text.startswith("}", index):
+            raise ValueError("not a JSON object")
+    if _skip_whitespace(text, index + 1) != len(text):
+        raise ValueError("more than one JSON value")
+    return values
+
+
+def _shared_beside_own_login(item: str, file: str) -> str | None:
+    """``file`` (the default profile's ``.credentials.json``, with the
+    computer's own login) with what the Keychain ``item`` keeps besides a
+    login added; ``None`` when that adds nothing. Only what the file lacks is
+    added: a key, or an entry of a dict both hold (an MCP server's login in
+    ``mcpOAuth``). The file's own keys and entries win, and the item's
+    ``claudeAiOauth`` and ``trustedDeviceToken`` (its login's) are not added.
+    What the file holds stays as it is written there, byte for byte, its
+    login above all. Raises ValueError when ``file`` is not one JSON
+    object."""
+    written = _written_values(file)
+    shared = _parsed(item)
+    if not isinstance(shared, dict):
+        return None
+    merged = {key: value for key, (value, _) in written.items()}
+    changed: set[str] = set()
+    for key, value in cast(dict[str, Any], shared).items():
+        if key in ACCOUNT_CREDENTIAL_KEYS:
+            continue
+        if key not in merged:
+            merged[key] = value
+            changed.add(key)
+            continue
+        here = merged[key]
+        if isinstance(here, dict) and isinstance(value, dict):
+            missing = {name: entry for name, entry in value.items() if name not in here}
+            if missing:
+                merged[key] = {**here, **missing}
+                changed.add(key)
+    if not changed:
+        return None
+    entries = (
+        f"{json.dumps(key)}: "
+        + (json.dumps(value) if key in changed else written[key][1])
+        for key, value in merged.items()
+    )
+    return "{" + ", ".join(entries) + "}"
+
+
+def _forget_item_beside_own_file(item: str, file: str) -> None:
+    """Remove the default profile's Keychain item: a leftover access token
+    that hides the computer's own login in ``.credentials.json`` from Claude
+    Code, which reads the item first while it holds JSON. What the item keeps
+    besides a login moves into the file first, in one owner-only write
+    (:func:`_shared_beside_own_login`); when that write fails nothing changes.
+    When the removal fails the item stays, its token too, and a retry
+    finishes it: the file already holds what moved."""
+    path = _default_credentials_path()
+    try:
+        merged = _shared_beside_own_login(item, file)
+    except ValueError as e:
+        raise CredentialWriteError(f"Could not read {path} as JSON: {e}") from e
+    if merged is not None:
+        _sweep_temporaries(path)
+        _write_private(path, merged)
+    try:
+        macos_keychain.delete_password(
+            CLAUDE_CODE_KEYCHAIN_SERVICE, macos_keychain.keychain_account_name()
+        )
+    except macos_keychain.KEYCHAIN_ERRORS as e:
+        raise CredentialWriteError(
+            "Could not remove Claude Code's Keychain item, which hides this "
+            f"computer's own login in {path}: {e}"
+        ) from e
+    _touch_newer(path)
+
+
+def forget_default_access_login() -> bool:
+    """Remove an access-only login from Claude Code's default profile
+    (sak.13): from its Keychain item (macOS) and from its
+    ``.credentials.json``, keeping what Claude Code keeps there besides a
+    login (an MCP server's login); an item or file with nothing else left
+    goes. The account (``oauthAccount``) leaves ``~/.claude.json``; nothing
+    else there changes. Under the locks :func:`use_access_login` holds.
+
+    Next to a login of the computer's own or a managed API key
+    (:attr:`DefaultLoginInfo.leftover_access`), only the leftover access
+    token goes, from the store that holds it, and ``~/.claude.json`` is not
+    touched. A leftover file next to an own login in the Keychain item only
+    loses its token: Claude Code reads the item first. A leftover Keychain
+    item next to an own login in ``.credentials.json`` goes whole, as Claude
+    Code would still read the item and not that login. What the item keeps
+    besides a login (an MCP server's login, a plugin's secrets) moves into the
+    file first, in one owner-only write: only what the file lacks, the file's
+    own keys win, and its login stays byte for byte. When that write fails
+    nothing changes, and the leftover still shows.
+
+    Returns False when there was no such login (nothing changes). Raises
+    :class:`OwnLoginError` when the default profile holds a login of its own
+    (``"own"`` in :func:`default_login`, an access token alone of one of
+    claude-swap's accounts here too) or a managed API key, and no leftover,
+    which is never removed; :class:`ConfigError` when ``~/.claude.json``
+    cannot be read as JSON or claude-swap's account list cannot be read, and
+    with a foreign ``CLAUDE_CONFIG_DIR`` or
+    ``CLAUDE_SECURESTORAGE_CONFIG_DIR``; :class:`CredentialReadError` when a
+    store cannot be read now; :class:`CredentialWriteError` when the login
+    stays; :class:`LockError` while Claude Code or a switch holds a lock.
+    Never prompts.
+    """
+    _refuse_other_store()
+    with _default_login_locks():
+        stores = _read_default_stores()
+        leftovers = _leftover_stores(stores)
+        if leftovers:
+            if "item" in leftovers and _login_kind(stores.file) == "own":
+                _forget_item_beside_own_file(stores.item or "", stores.file or "")
+            elif "item" in leftovers:
+                _forget_in_item(stores.item or "")
+            if "file" in leftovers:
+                _forget_in_file(stores.file or "")
+            _logger.debug(
+                "api: a leftover access token left Claude Code's default profile"
+            )
+            return True
+        _refuse_own_default(stores)
+        in_item = _login_kind(stores.item) == "access"
+        in_file = _login_kind(stores.file) == "access"
+        if not (in_item or in_file):
+            return False
+        _refuse_broken_config(stores)
+        # The account goes first: a removal that fails then leaves a login
+        # this reads again, and a retry finishes it.
+        if stores.config is not None and "oauthAccount" in stores.config:
+            _write_default_config(
+                {
+                    key: value
+                    for key, value in stores.config.items()
+                    if key != "oauthAccount"
+                }
+            )
+        if in_item:
+            _forget_in_item(stores.item or "")
+        if in_file:
+            _forget_in_file(stores.file or "")
+    _logger.debug("api: the access-only login left Claude Code's default profile")
+    return True

@@ -574,6 +574,32 @@ class TestDecisionTable:
         assert reasons == ["unmanaged-active-account"]
         assert (temp_home / ".claude" / ".credentials.json").read_text() == live_before
 
+    def test_a_lent_live_login_is_never_touched(self, temp_home):
+        """sak.13: another computer lent account 2's access token (claude-SAK's
+        token sync, no refresh token): not this computer's login of it, so
+        the engine leaves it alone and says why."""
+        h = EngineHarness(temp_home)
+        h.seed(1, "a@example.com")
+        h.seed(2, "b@example.com")
+        (temp_home / ".claude" / ".credentials.json").write_text(json.dumps({
+            "claudeAiOauth": {
+                "accessToken": "sk-ant-oat01-lent",
+                "refreshToken": None,
+                "expiresAt": 4102444800000,
+                "scopes": ["user:profile", "user:inference"],
+            },
+        }))
+        (temp_home / ".claude.json").write_text(json.dumps({
+            "oauthAccount": {"emailAddress": "b@example.com", "accountUuid": "uuid-2"},
+        }))
+        live_before = (temp_home / ".claude" / ".credentials.json").read_text()
+        outcome = h.tick_with_usage({"1": _usage(10), "2": _usage(95)})
+        assert outcome is TickOutcome.NO_ACTION
+        events = [e for e in h.events if isinstance(e, NoSwitchEvent)]
+        assert [e.reason for e in events] == ["unmanaged-active-account"]
+        assert "another computer lent" in events[0].detail
+        assert (temp_home / ".claude" / ".credentials.json").read_text() == live_before
+
     def test_all_exhausted_carries_earliest_reset(self, harness):
         outcome = harness.tick_with_usage({
             "1": _usage(100, "2026-07-03T12:00:00Z"),

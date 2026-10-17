@@ -642,8 +642,9 @@ class SessionManager:
             # Same-account fast path: never create a second credential copy
             # for the account that is already the active default login —
             # two copies of one account can drift if the server rotates the
-            # refresh token.
-            current = self.switcher._get_current_account()
+            # refresh token. A login another computer lent (sak.13) shares no
+            # refresh token with the stored one, so it does not count.
+            current = self.switcher._own_live_identity()
             if current is not None and current == (email, org_uuid):
                 if require_session:
                     raise SessionError(

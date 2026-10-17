@@ -647,6 +647,44 @@ class TestValidation:
 # ---------------------------------------------------------------------------
 
 
+_LENT = {
+    "accessToken": "sk-ant-oat01-lent",
+    "refreshToken": None,
+    "expiresAt": 4102444800000,
+    "scopes": ["user:profile", "user:inference"],
+}
+"""A login another computer lent with claude-SAK's token sync (sak.13)."""
+
+
+class TestLentLogin:
+    """sak.13: an access token another computer lent has no refresh token;
+    it never travels as an account's login."""
+
+    def test_export_takes_the_stored_login_not_the_lent_one(self, temp_home: Path):
+        s = _linux_switcher(temp_home)
+        _seed_account(s, 1, "a@example.com")
+        (temp_home / ".claude" / ".credentials.json").write_text(
+            json.dumps({"claudeAiOauth": _LENT})
+        )
+        (temp_home / ".claude.json").write_text(json.dumps({
+            "oauthAccount": {"emailAddress": "a@example.com", "accountUuid": "acct-1"},
+        }))
+        out_file = temp_home / "backup.cswap"
+        export_accounts(s, str(out_file))
+        exported = json.loads(out_file.read_text())["accounts"][0]["credentials"]
+        assert exported == {**SAMPLE_CREDS, "_marker": "a@example.com"}
+
+    def test_import_refuses_a_lent_login(self, temp_home: Path):
+        s = _linux_switcher(temp_home)
+        env = TestValidation()._make_envelope()
+        env["accounts"][0]["credentials"] = {"claudeAiOauth": _LENT}
+        f = temp_home / "c.cswap"
+        f.write_text(json.dumps(env))
+        with pytest.raises(TransferError, match="lent by another computer"):
+            import_accounts(s, str(f))
+        assert not (s._get_sequence_data() or {}).get("accounts")
+
+
 class TestPipeMode:
     def test_export_to_stdout_writes_only_json(self, temp_home: Path, capsys):
         s = _linux_switcher(temp_home)

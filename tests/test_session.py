@@ -1346,6 +1346,43 @@ class TestRun:
         assert "CLAUDE_CONFIG_DIR" not in exc.value.env
         assert "already the active default login" in capsys.readouterr().out
 
+    def test_a_lent_default_login_takes_no_fast_path(
+        self,
+        manager,
+        capture_exec,
+        monkeypatch,
+        auth_status_tracks_seed,
+        refresh_rotates,
+    ):
+        """sak.13: another computer lent the default login of this account (an
+        access token alone): plain claude would run on that token, not on
+        the account's own login, so the launch goes to its session profile."""
+        from claude_swap.credentials import ActiveCredentials
+
+        monkeypatch.setattr(
+            manager.switcher,
+            "_get_current_account",
+            lambda: (ACCOUNT_EMAIL, ORG_UUID),
+        )
+        lent = json.dumps({"claudeAiOauth": {
+            "accessToken": "sk-ant-oat01-lent",
+            "refreshToken": None,
+            "expiresAt": 4102444800000,
+            "scopes": ["user:profile", "user:inference"],
+        }})
+        monkeypatch.setattr(
+            manager.switcher,
+            "_read_active_credentials",
+            lambda: ActiveCredentials(lent, False, False),
+        )
+        with pytest.raises(_ExecCalled) as exc:
+            manager.run("2", [])
+
+        session_dir = session_dir_for(
+            manager.switcher.backup_dir, ACCOUNT_NUM, ACCOUNT_EMAIL
+        )
+        assert exc.value.env["CLAUDE_CONFIG_DIR"] == str(session_dir)
+
     def test_require_session_refuses_fast_path(
         self, manager, capture_exec, monkeypatch
     ):

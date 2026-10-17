@@ -1933,17 +1933,89 @@ class ClaudeAccountSwitcher:
         overwrite a login cswap doesn't own (``_perform_switch`` would take
         the no-backup direct-activation path). Use :meth:`has_live_login` to
         tell the two ``None`` cases apart.
+
+        A live login another computer lent (an access token alone, sak.13:
+        :meth:`_live_login_is_lent`) is not this computer's login of its
+        account even when that account is managed here: it counts as
+        unmanaged, so ``None``.
         """
         identity = self._get_current_account()
         if identity is None:
             return None
         data = self._get_sequence_data() or {}
         email, org_uuid = identity
-        return self._find_account_slot(data, email, org_uuid)
+        slot = self._find_account_slot(data, email, org_uuid)
+        if slot is not None and self._live_login_is_lent():
+            return None
+        return slot
 
     def has_live_login(self) -> bool:
         """Whether ``~/.claude.json`` carries any live account identity."""
         return self._get_current_account() is not None
+
+    @staticmethod
+    def _read_cleanly(active: ActiveCredentials) -> bool:
+        """Whether a read of the live login can tell what it is: neither the
+        Keychain nor the file failed. After a failed Keychain read the bytes
+        served may be a stale file's (on macOS Claude Code writes its
+        Keychain item only), so they never make the live login count as
+        lent (sak.13)."""
+        return not (
+            active.value is None or active.degraded or active.keychain_unavailable
+        )
+
+    @classmethod
+    def _cleanly_lent(cls, active: ActiveCredentials) -> bool:
+        """Whether this read shows a login another computer lent, told only
+        from a clean read (:meth:`_read_cleanly`); otherwise the live login is
+        taken as upstream takes it."""
+        return cls._read_cleanly(active) and oauth.is_lent_login(active.value)
+
+    def _live_login_lent(self) -> bool | None:
+        """Whether Claude Code's live login is one another computer lent: an
+        access token alone (``oauth.is_lent_login``, sak.13). ``None``
+        when that cannot be told now: the Keychain or the file could not be
+        read, so the bytes served may be an older generation. Code about to
+        store live bytes checks those bytes themselves instead."""
+        active = self._read_active_credentials()
+        if not self._read_cleanly(active):
+            return None
+        return oauth.is_lent_login(active.value)
+
+    def _live_login_is_lent(self) -> bool:
+        """Whether the live login is known to be lent (:meth:`_live_login_lent`);
+        when that cannot be told, it is taken as upstream takes it."""
+        return self._live_login_lent() is True
+
+    def _own_live_identity(self) -> tuple[str, str] | None:
+        """The live ``(email, organization_uuid)``, unless the live login is
+        known to be lent (:meth:`_live_login_is_lent`): the account Claude
+        Code's default profile is logged in to with a login of this
+        computer's own, which that account's stored login follows. ``None``
+        without a live login too. For refusals that guard that login."""
+        identity = self._get_current_account()
+        if identity is None or self._live_login_is_lent():
+            return None
+        return identity
+
+    def _live_login_followed_for(self, email: str, org_uuid: str) -> bool:
+        """Whether the live login is this account's and known to be this
+        computer's own (not lent, :meth:`_live_login_lent`), so the account's
+        stored login follows it.
+
+        Raises :class:`CredentialReadError` when the live login is this
+        account's but cannot be read cleanly now: whether to store a login
+        or to follow the live one cannot be told then, so nothing is stored
+        and nothing dropped."""
+        if self._get_current_account() != (email, org_uuid or ""):
+            return False
+        lent = self._live_login_lent()
+        if lent is None:
+            raise CredentialReadError(
+                "Claude Code's default login here cannot be read now; try again "
+                "in a moment."
+            )
+        return not lent
 
     def live_session_pids_for(self, account_num: str, email: str) -> list[int]:
         """Public wrapper: PIDs of live ``cswap run`` sessions for a slot."""
@@ -3313,6 +3385,19 @@ class ClaudeAccountSwitcher:
                 "'cswap --add-token sk-ant-api...' instead of --add-account."
             )
 
+    def _reject_lent_capture(self, creds: str) -> None:
+        """Guard for ``add_account``: never capture a login another computer
+        lent (sak.13: an access token alone, ``oauth.is_lent_login``).
+        It has no refresh token, so a stored copy would stop working when the
+        token lapses, and only the computer that holds the login renews it."""
+        if oauth.is_lent_login(creds):
+            raise ValidationError(
+                "The login to add is an access token another computer lent (it "
+                "has no refresh token), so claude-swap could not renew it here. "
+                "Log in on this computer first (claude /login), then add the "
+                "account."
+            )
+
     def _reject_cross_kind_collision(self, email: str, is_api_key: bool) -> None:
         """Reject registering a token whose (email, personal-org) already exists as
         the *other* kind.
@@ -3537,6 +3622,7 @@ class ClaudeAccountSwitcher:
             if not current_creds:
                 raise CredentialReadError("No credentials found for current account")
             self._reject_live_api_key_capture(current_creds)
+            self._reject_lent_capture(current_creds)
             current_creds = self._reject_foreign_credential_capture(
                 current_creds, current_email, current_org_uuid,
                 current_account_uuid,
@@ -3664,6 +3750,7 @@ class ClaudeAccountSwitcher:
         if not current_creds:
             raise CredentialReadError("No credentials found for current account")
         self._reject_live_api_key_capture(current_creds)
+        self._reject_lent_capture(current_creds)
         current_creds = self._reject_foreign_credential_capture(
             current_creds, current_email, current_org_uuid, current_account_uuid
         )
@@ -3788,7 +3875,10 @@ class ClaudeAccountSwitcher:
           independent login: its stored login follows the live one (switching
           and the auto-switch engine keep the two in step). When it is managed
           nothing changes; when it is not, the live login is registered, as
-          ``add_account`` would.
+          ``add_account`` would. That holds for a live login of this
+          computer's own only: one another computer lent (an access token
+          alone, sak.13) is not followed, so the profile's login is stored as
+          for any other account.
 
         The profile keeps its login until
         :func:`claude_swap.session.forget_config_dir_login` removes it.
@@ -3798,8 +3888,11 @@ class ClaudeAccountSwitcher:
             ConfigError: the profile has no login, or its credential belongs
                 to another account.
             CredentialReadError: the profile's credential is missing or its
-                Keychain item is unreadable.
-            ValidationError: a bad or taken alias, or an API-key login.
+                Keychain item is unreadable, or the default profile is
+                logged in to that account and its login cannot be read
+                cleanly now (sak.13: nothing is stored then).
+            ValidationError: a bad or taken alias, an API-key login, or an
+                access token alone (lent by another computer, sak.13).
         """
         from claude_swap.session import read_config_dir_credentials
 
@@ -3819,7 +3912,7 @@ class ClaudeAccountSwitcher:
         org_uuid = oauth_account.get("organizationUuid") or ""
         account_uuid = oauth_account.get("accountUuid") or ""
 
-        if self._get_current_account() == (email, org_uuid):
+        if self._live_login_followed_for(email, org_uuid):
             data = self._get_sequence_data() or {}
             live_slot = self._find_account_slot(data, email, org_uuid)
             if live_slot is not None:
@@ -3839,6 +3932,12 @@ class ClaudeAccountSwitcher:
             raise ValidationError(
                 f"The login in {config_dir} is an API key. Add it with "
                 "'cswap --add-token sk-ant-api...' instead."
+            )
+        if oauth.is_lent_login(creds):
+            raise ValidationError(
+                f"The login in {config_dir} is an access token another computer "
+                "lent (it has no refresh token), so claude-swap could not renew "
+                "it here. Log in there first (claude auth login), then add it."
             )
         creds = self._reject_foreign_credential_capture(
             creds, email, org_uuid, account_uuid
@@ -4230,8 +4329,20 @@ class ClaudeAccountSwitcher:
 
             if is_active:
                 active = self._read_active_credentials()
-                creds = active.value or ""
-                self._record_active_verdict(active)
+                if self._cleanly_lent(active):
+                    # A login another computer lent (sak.13) is not this
+                    # account's login here: the slot is not the active one,
+                    # its stored login serves it, and the live store is
+                    # never renewed or restored from here. Told only from a
+                    # clean read: lent bytes a failed Keychain read served
+                    # may be a stale file's next to the account's own login,
+                    # so the slot stays active and _fetch_active_usage
+                    # defers what would spend a refresh token.
+                    is_active = False
+                    creds = self._read_account_credentials(str(num), email)
+                else:
+                    creds = active.value or ""
+                    self._record_active_verdict(active)
             else:
                 creds = self._read_account_credentials(str(num), email)
 
@@ -4475,6 +4586,11 @@ class ClaudeAccountSwitcher:
                 #   live bytes may be CONSUMED or must be replaced from the
                 #   backup.
                 if not self._live_identity_matches(email, org_uuid):
+                    return _defer(force_refresh)
+                if oauth.is_lent_login(live):
+                    # Another computer lent it (sak.13) since the collector
+                    # read: it is not this account's login here, so it is
+                    # neither renewed nor replaced by the stored one.
                     return _defer(force_refresh)
                 if (
                     live_oauth
@@ -5799,7 +5915,11 @@ class ClaudeAccountSwitcher:
             self._logger.debug("Failed to detect running instances", exc_info=True)
 
     def _active_account_usage(
-        self, account_num: str, current_email: str, org_uuid: str
+        self,
+        account_num: str,
+        current_email: str,
+        org_uuid: str,
+        active: ActiveCredentials | None = None,
     ) -> UsageEntry:
         """Store-backed usage entry for just the active account.
 
@@ -5807,39 +5927,46 @@ class ClaudeAccountSwitcher:
         (``--status`` touches one slot) and runs it through the shared
         collector, so freshness/backoff/claim gating and the shared
         ``cache/usage.json`` table behave exactly as in ``--list``.
+        ``active`` is the live read the caller made already, if any.
         """
-        active = self._read_active_credentials()
+        if active is None:
+            active = self._read_active_credentials()
         creds = active.value or ""
         self._record_active_verdict(active)
         info = (int(account_num), current_email, "", org_uuid or "", True, creds, "")
         return self._collect_usage_entries([info])[str(account_num)]
 
     def _build_status_payload(self) -> dict:
-        """Build the ``--status --json`` payload (no active / unmanaged / managed)."""
+        """Build the ``--status --json`` payload (no active / unmanaged / managed).
+
+        A live login another computer lent (an access token alone, sak.13)
+        is not this computer's login of its account: it reads as unmanaged,
+        with ``accessLent: true``, and nothing renews it from here. Told only
+        from a clean read (:meth:`_cleanly_lent`).
+        """
         identity = self._get_current_account()
         if identity is None:
             return {"schemaVersion": SCHEMA_VERSION, "active": None}
         current_email, current_org_uuid = identity
+        live = self._read_active_credentials()
+        unmanaged: dict = {"email": current_email, "managed": False}
+        if self._cleanly_lent(live):
+            unmanaged["accessLent"] = True
+            return {"schemaVersion": SCHEMA_VERSION, "active": unmanaged}
 
         data = self._get_sequence_data_migrated()
         if not data:
-            return {
-                "schemaVersion": SCHEMA_VERSION,
-                "active": {"email": current_email, "managed": False},
-            }
+            return {"schemaVersion": SCHEMA_VERSION, "active": unmanaged}
 
         account_num = self._find_account_slot(data, current_email, current_org_uuid)
         if not account_num:
-            return {
-                "schemaVersion": SCHEMA_VERSION,
-                "active": {"email": current_email, "managed": False},
-            }
+            return {"schemaVersion": SCHEMA_VERSION, "active": unmanaged}
 
         acct = data["accounts"][account_num]
         org_name = acct.get("organizationName", "") or ""
         org_uuid = acct.get("organizationUuid", "") or ""
         alias = acct.get("alias", "") or ""
-        entry = self._active_account_usage(account_num, current_email, org_uuid)
+        entry = self._active_account_usage(account_num, current_email, org_uuid, live)
         # Decision-grade projection, same rule as the --list payload: stale
         # beyond STALE_OK_S reports unavailable, not "ok" with old numbers.
         status, usage = usage_fields(entry.decision_value(), entry.fetched_at)
@@ -5887,6 +6014,13 @@ class ClaudeAccountSwitcher:
             print(f"{bolded('Status:')} {dimmed('No active Claude account')}")
             return None
         current_email, current_org_uuid = identity
+        live = self._read_active_credentials()
+        if self._cleanly_lent(live):
+            print(
+                f"{bolded('Status:')} {current_email} "
+                f"{dimmed('(access lent by another computer)')}"
+            )
+            return None
 
         data = self._get_sequence_data_migrated()
         if not data:
@@ -5907,7 +6041,7 @@ class ClaudeAccountSwitcher:
             )
             print(f"  {dimmed(f'Total managed accounts: {total}')}")
             entry = self._active_account_usage(
-                account_num, current_email, current_org_uuid
+                account_num, current_email, current_org_uuid, live
             )
             for line in _usage_entry_lines(entry):
                 print(f"  {line}")
@@ -6102,6 +6236,9 @@ class ClaudeAccountSwitcher:
 
         # Check if current account is managed
         if not self._account_exists(current_email, current_org_uuid):
+            # A login another computer lent (sak.13) cannot be added: it has
+            # no refresh token. Say what to do instead of auto-adding it.
+            lent = self._live_login_is_lent()
             # In JSON mode, don't silently auto-add (a surprising side effect in
             # automation) — report it as a structured no-op instead.
             if json_output:
@@ -6111,7 +6248,21 @@ class ClaudeAccountSwitcher:
                     reason="unmanaged-account",
                     from_ref=ref,
                     to_ref=ref,
-                    message="Active account is not managed; run cswap --add-account",
+                    message=(
+                        "Claude Code's default login is access another computer "
+                        "lent; switch to one of your accounts with: cswap switch "
+                        "<number>"
+                        if lent
+                        else "Active account is not managed; run cswap --add-account"
+                    ),
+                )
+            if lent:
+                raise ConfigError(
+                    f"Claude Code's default login here ({current_email}) is access "
+                    "another computer lent (an access token without its refresh "
+                    "token), so claude-swap cannot add it to the rotation. Switch to "
+                    "one of your accounts with: cswap switch <number>. To add this "
+                    "account here, log in on this computer first (claude /login)."
                 )
             print(f"{accent('Notice:')} Active account '{current_email}' was not managed.")
             self.add_account()
@@ -6357,7 +6508,9 @@ class ClaudeAccountSwitcher:
         # behavior, silent); a resolved divergence falls through so
         # _perform_switch can reconcile it.
         provenance: dict | None = None
-        if next_account == current_num:
+        # A lent live login (sak.13) is not this slot's: the switch puts the
+        # slot's own login in its place instead of a no-op.
+        if next_account == current_num and not self._live_login_is_lent():
             action, provenance = self._self_switch_action(
                 next_account, current_email
             )
@@ -6458,6 +6611,11 @@ class ClaudeAccountSwitcher:
             identity = self._get_current_account()
             if identity is not None:
                 cur_slot = self._find_account_slot(data, identity[0], identity[1])
+                if cur_slot == target_account and self._live_login_is_lent():
+                    # Another computer lent the live login (sak.13): it is
+                    # not this slot's, and the switch puts the slot's own
+                    # login in its place.
+                    cur_slot = None
                 if cur_slot == target_account:
                     action, provenance = self._self_switch_action(
                         target_account, identity[0]
@@ -6583,7 +6741,8 @@ class ClaudeAccountSwitcher:
             self._logger.debug(f"Pre-lock live credential read failed: {e!r}")
             return result
         result["live"] = live
-        if not live:
+        if not live or oauth.is_lent_login(live):
+            # A lent login (sak.13) is never backed up: nothing to resolve.
             return result
         identity = self._get_current_account()
         if identity is None:
@@ -6668,7 +6827,15 @@ class ClaudeAccountSwitcher:
           the exact pre-fix backup: the identity oracle is advisory, and
           endpoint state must never change switch behavior beyond skipping
           the extra safety.
+        - ``"lent"``           — an access token alone that another computer
+          lent (sak.13, ``oauth.is_lent_login``): never written into
+          any slot (it would replace the slot's only refresh token), and
+          nothing to preserve (the computer that lent it holds the login).
+          ``_perform_switch`` takes the direct path for it before this runs;
+          the kind keeps the write site safe on its own.
         """
+        if oauth.is_lent_login(original_creds):
+            return ("lent", None)
         backup = self._read_account_credentials(current_account, current_email)
         if backup and backup == original_creds:
             return ("own-bytes", None)
@@ -6983,21 +7150,50 @@ class ClaudeAccountSwitcher:
 
             config_path = self._get_claude_config_path()
 
+            # A live login another computer lent (sak.13: an access token
+            # alone) is not this computer's login of its account, even when
+            # that account is managed here: it is never backed up into the
+            # slot (it would replace the slot's only refresh token) nor kept
+            # in a safety copy, and the switch replaces it as it replaces an
+            # unmanaged live login. Bytes that may be an older generation (the
+            # Keychain failed) cannot tell what would be replaced: refuse.
+            lent = False
+            if (
+                not force_activate
+                and current_identity is not None
+                and current_account is not None
+            ):
+                live_read = self._read_active_credentials()
+                lent = oauth.is_lent_login(live_read.value)
+                if lent and live_read.degraded:
+                    raise CredentialReadError(
+                        "Claude Code's default login cannot be read now (the "
+                        "Keychain is locked or busy), so claude-swap cannot tell "
+                        "what the switch would replace; nothing was changed. "
+                        "Unlock it and try again."
+                    )
+
             # Direct activation path: there is no live Claude session yet
             # (e.g. right after import), claude-swap has no tracked active
             # account yet (e.g. purge -> add-token -> switch-to while a live
-            # Claude credential still exists), or --force asked to rewrite the
-            # live login from the stored backup. In all cases, skip the
-            # back-up-current step: it would either write account-None-*
-            # backups or (force) poison the stored backup with stale creds.
-            if force_activate or current_identity is None or current_account is None:
+            # Claude credential still exists), --force asked to rewrite the
+            # live login from the stored backup, or the live login is lent.
+            # In all cases, skip the back-up-current step: it would either
+            # write account-None-* backups or (force, lent) poison the stored
+            # backup with stale or foreign creds.
+            if (
+                force_activate
+                or current_identity is None
+                or current_account is None
+                or lent
+            ):
                 # Account left: None on a fresh machine (no live account at
-                # all); an unnumbered ref for an unmanaged live account (slot
-                # unknown to cswap); a numbered ref when --force ran with a
-                # managed live login.
+                # all); an unnumbered ref for an unmanaged or lent live
+                # account (not one of cswap's logins); a numbered ref when
+                # --force ran with a managed live login.
                 if current_identity is None:
                     from_ref = None
-                elif current_account is None:
+                elif current_account is None or lent:
                     from_ref = account_ref(None, current_identity[0])
                 else:
                     from_ref = account_ref(int(current_account), current_identity[0])
@@ -7054,8 +7250,15 @@ class ClaudeAccountSwitcher:
                 # anywhere; for --force it guards against the "stale" live
                 # login actually being the fresher generation. A failed stash
                 # aborts, except under --force where the user explicitly
-                # asked for the overwrite.
-                if rollback_creds and rollback_creds != target_creds:
+                # asked for the overwrite. A lent login (sak.13: an access
+                # token alone) is not stashed: no login is lost with it (the
+                # computer that lent it holds the login), and claude-swap
+                # never keeps another computer's token.
+                if (
+                    rollback_creds
+                    and rollback_creds != target_creds
+                    and not oauth.is_lent_login(rollback_creds)
+                ):
                     try:
                         self._stash_live_credential(
                             rollback_creds,
@@ -7155,7 +7358,12 @@ class ClaudeAccountSwitcher:
                             )
                     raise
 
-                if force_activate and current_identity is not None:
+                if lent:
+                    self._logger.info(
+                        f"Activated account {target_account} in place of a login "
+                        "another computer lent (not backed up)"
+                    )
+                elif force_activate and current_identity is not None:
                     self._logger.info(
                         f"Activated account {target_account} "
                         "(forced, backup of current login skipped)"
@@ -7316,6 +7524,13 @@ class ClaudeAccountSwitcher:
                         f"Backed up account {current_account} (lineage "
                         "differs from the stored backup and ownership could "
                         "not be verified — pre-fix backup)"
+                    )
+                elif kind == "lent":
+                    # Another computer's access token (sak.13): the slot
+                    # keeps its own login and config; nothing is written.
+                    self._logger.info(
+                        f"Account {current_account}'s stored login kept: the "
+                        "live login was one another computer lent"
                     )
                 elif kind == "own-bytes":
                     # Untouched since cswap wrote it — the slot already holds

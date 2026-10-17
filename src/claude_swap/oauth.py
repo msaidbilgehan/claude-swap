@@ -111,6 +111,64 @@ def is_setup_token(credentials: str) -> bool:
     return oauth.get("scopes") == ["user:inference"]
 
 
+def is_access_only_login(credentials: str | None) -> bool:
+    """Whether a credential is a login on an access token alone (sak.13):
+    ``claudeAiOauth`` with an access token, its expiry, and no refresh token
+    (null, missing, or blank). It cannot be renewed here.
+
+    A setup-token has no refresh token either, but it is one of
+    claude-swap's own accounts, and no setup-token claude-swap ever stored
+    records an expiry (early ones carry no scopes, or a login's scopes, so
+    :func:`is_setup_token` cannot tell them all): without ``expiresAt`` it
+    is not one.
+    """
+    if not credentials:
+        return False
+    try:
+        data = json.loads(credentials)
+    except (TypeError, ValueError):
+        return False
+    oauth = data.get("claudeAiOauth") if isinstance(data, dict) else None
+    if not isinstance(oauth, dict):
+        return False
+    access = oauth.get("accessToken")
+    if not isinstance(access, str) or not access.strip():
+        return False
+    refresh = oauth.get("refreshToken")
+    if isinstance(refresh, str) and refresh.strip():
+        return False
+    expires = oauth.get("expiresAt")
+    if isinstance(expires, bool) or not isinstance(expires, (int, float)):
+        return False
+    return oauth.get("scopes") != ["user:inference"]
+
+
+def is_lent_login(credentials: str | None) -> bool:
+    """Whether a credential is a login another computer lent with
+    claude-SAK's token sync (sak.13): an access-only login
+    (:func:`is_access_only_login`) as ``api.keep_access_login`` and
+    ``api.use_access_login`` write one, with ``refreshToken`` null and its
+    scopes recorded.
+
+    It is not this computer's login of its account, and only the computer
+    that lent it renews it: claude-swap never stores it, never backs it up
+    and never follows it as the live login of a managed account. Other
+    logins without a refresh token (one that lost it) are handled as
+    upstream handles them.
+    """
+    if not is_access_only_login(credentials):
+        return False
+    oauth = json.loads(credentials or "")["claudeAiOauth"]
+    if "refreshToken" not in oauth or oauth["refreshToken"] is not None:
+        return False
+    scopes = oauth.get("scopes")
+    return (
+        isinstance(scopes, list)
+        and bool(scopes)
+        and all(isinstance(scope, str) and scope.strip() for scope in scopes)
+    )
+
+
 def is_oauth_token_expired(expires_at: object) -> bool:
     """Return whether an OAuth token is expired or about to expire."""
     if not isinstance(expires_at, (int, float)):
