@@ -76,6 +76,7 @@ from claude_swap.credentials import (
     ACCOUNT_CREDENTIAL_KEYS,
     CLAUDE_CODE_KEYCHAIN_SERVICE,
     CLAUDE_CODE_MANAGED_KEYCHAIN_SERVICE,
+    SHARED_CREDENTIAL_KEYS,
     CredentialStore,
     looks_like_api_key,
 )
@@ -4104,14 +4105,16 @@ def _written_values(text: str) -> dict[str, tuple[Any, str]]:
 
 def _shared_beside_own_login(item: str, file: str) -> str | None:
     """``file`` (the default profile's ``.credentials.json``, with the
-    computer's own login) with what the Keychain ``item`` keeps besides a
-    login added; ``None`` when that adds nothing. Only what the file lacks is
-    added: a key, or an entry of a dict both hold (an MCP server's login in
-    ``mcpOAuth``). The file's own keys and entries win, and the item's
-    ``claudeAiOauth`` and ``trustedDeviceToken`` (its login's) are not added.
-    What the file holds stays as it is written there, byte for byte, its
-    login above all. Raises ValueError when ``file`` is not one JSON
-    object."""
+    computer's own login) with the machine-shared keys the Keychain ``item``
+    keeps added (``SHARED_CREDENTIAL_KEYS``: an MCP server's login, a
+    plugin's secrets); ``None`` when that adds nothing. Only what the file
+    lacks is added: a key, or an entry of a dict both hold (an MCP server's
+    login in ``mcpOAuth``). The file's own keys and entries win. Nothing
+    else of the item's is added: its login, that login's ``trustedDeviceToken``,
+    and keys claude-swap does not know, which may belong to the lent login's
+    account (a switch leaves them with their account too). What the file
+    holds stays as it is written there, byte for byte, its login above all.
+    Raises ValueError when ``file`` is not one JSON object."""
     written = _written_values(file)
     shared = _parsed(item)
     if not isinstance(shared, dict):
@@ -4119,7 +4122,7 @@ def _shared_beside_own_login(item: str, file: str) -> str | None:
     merged = {key: value for key, (value, _) in written.items()}
     changed: set[str] = set()
     for key, value in cast(dict[str, Any], shared).items():
-        if key in ACCOUNT_CREDENTIAL_KEYS:
+        if key not in SHARED_CREDENTIAL_KEYS:
             continue
         if key not in merged:
             merged[key] = value
@@ -4144,11 +4147,12 @@ def _shared_beside_own_login(item: str, file: str) -> str | None:
 def _forget_item_beside_own_file(item: str, file: str) -> None:
     """Remove the default profile's Keychain item: a leftover access token
     that hides the computer's own login in ``.credentials.json`` from Claude
-    Code, which reads the item first while it holds JSON. What the item keeps
-    besides a login moves into the file first, in one owner-only write
+    Code, which reads the item first while it holds JSON. The machine-shared
+    keys the item keeps move into the file first, in one owner-only write
     (:func:`_shared_beside_own_login`); when that write fails nothing changes.
-    When the removal fails the item stays, its token too, and a retry
-    finishes it: the file already holds what moved."""
+    When the removal fails the item stays, its token too, and the file is put
+    back as it was (:func:`_unmerge_beside_item`), so a retry moves what the
+    item holds by then."""
     path = _default_credentials_path()
     try:
         merged = _shared_beside_own_login(item, file)
@@ -4162,11 +4166,32 @@ def _forget_item_beside_own_file(item: str, file: str) -> None:
             CLAUDE_CODE_KEYCHAIN_SERVICE, macos_keychain.keychain_account_name()
         )
     except macos_keychain.KEYCHAIN_ERRORS as e:
+        if merged is not None:
+            _unmerge_beside_item(path, file)
         raise CredentialWriteError(
             "Could not remove Claude Code's Keychain item, which hides this "
             f"computer's own login in {path}: {e}"
         ) from e
     _touch_newer(path)
+
+
+def _unmerge_beside_item(path: Path, file: str) -> None:
+    """Put the own login's file back as it was (``file``) after the Keychain
+    item it hides could not be removed, while the item is still there:
+    Claude Code goes on reading the item, and may renew an MCP server's login
+    there before a retry, which would then keep the file's older copy of it
+    (the file's entries win) and leave that server asking to sign in again.
+    Best effort: when the item may be gone (a removal can fail after it
+    happened, or the check cannot tell) or the file cannot be written, the
+    file keeps what moved, so nothing the item held is lost."""
+    if not macos_keychain.item_exists(
+        CLAUDE_CODE_KEYCHAIN_SERVICE, macos_keychain.keychain_account_name()
+    ):
+        return
+    try:
+        _write_private(path, file)
+    except CredentialWriteError as e:
+        _logger.warning("api: %s could not be put back as it was: %s", path, e)
 
 
 def forget_default_access_login() -> bool:
@@ -4183,11 +4208,13 @@ def forget_default_access_login() -> bool:
     touched. A leftover file next to an own login in the Keychain item only
     loses its token: Claude Code reads the item first. A leftover Keychain
     item next to an own login in ``.credentials.json`` goes whole, as Claude
-    Code would still read the item and not that login. What the item keeps
-    besides a login (an MCP server's login, a plugin's secrets) moves into the
+    Code would still read the item and not that login. The machine-shared
+    keys it keeps (an MCP server's login, a plugin's secrets) move into the
     file first, in one owner-only write: only what the file lacks, the file's
-    own keys win, and its login stays byte for byte. When that write fails
-    nothing changes, and the leftover still shows.
+    own keys win, and its login stays byte for byte; keys claude-swap does not
+    know stay out, as a switch leaves them with their account. When that
+    write fails, or the item cannot be removed, nothing changes and the
+    leftover still shows; a retry moves what the item holds by then.
 
     Returns False when there was no such login (nothing changes). Raises
     :class:`OwnLoginError` when the default profile holds a login of its own

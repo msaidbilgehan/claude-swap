@@ -4722,8 +4722,33 @@ class TestLeftoverAccess:
         assert json.loads(_default_file(temp_home).read_text()) == {
             **own,
             "mcpOAuth": {"shared": {"accessToken": "file"}, "more": more},
-            "laterKey": [1, 2],
         }
+        assert macos.get_password(*_default_item()) is None
+
+    def test_only_the_keys_every_account_shares_move(self, kept, macos, temp_home):
+        """A switch carries only the machine-shared keys from one login to
+        another; a key claude-swap does not know may belong to the lent
+        login's account, so it goes with the item, as the item's device
+        token does."""
+        own = _token_login("sk-own", "rt-own", _in(hours=8))
+        _default_file(temp_home).write_text(json.dumps(own))
+        shared = {
+            "mcpOAuth": {"server": {"accessToken": "mcp"}},
+            "mcpOAuthClientConfig": {"server": {"clientId": "c"}},
+            "mcpXaaIdp": {"idp": "x"},
+            "mcpXaaIdpConfig": {"idp": "y"},
+            "pluginSecrets": {"plugin": {"key": "secret"}},
+        }
+        macos.set_password(*_default_item(), json.dumps({
+            **_token_login("sk-ant-oat01-lent", None, _in(hours=1)),
+            **shared,
+            "trustedDeviceToken": "tdt-lent",
+            "laterKey": "lent-account-bound",
+        }))
+        assert api.forget_default_access_login() is True
+        text = _default_file(temp_home).read_text()
+        assert json.loads(text) == {**own, **shared}
+        assert "lent-account-bound" not in text and "tdt-lent" not in text
         assert macos.get_password(*_default_item()) is None
 
     def test_a_failed_write_of_the_own_file_changes_nothing(
@@ -4773,17 +4798,75 @@ class TestLeftoverAccess:
             raise macos_keychain.KeychainError("security timed out")
 
         monkeypatch.setattr(macos_keychain, "delete_password", busy)
+        before = _everything(temp_home, macos)
         with pytest.raises(api.CredentialWriteError, match="Keychain"):
             api.forget_default_access_login()
         assert macos.get_password(*_default_item()) == item  # the token stays there
-        moved = {**own, "mcpOAuth": mcp}
-        assert json.loads(_default_file(temp_home).read_text()) == moved
+        assert _everything(temp_home, macos) == before  # the file is put back
         assert api.default_login().leftover_access is True
         monkeypatch.setattr(macos_keychain, "delete_password", macos.delete_password)
         assert api.forget_default_access_login() is True
         assert macos.get_password(*_default_item()) is None
+        moved = {**own, "mcpOAuth": mcp}
         assert json.loads(_default_file(temp_home).read_text()) == moved
         assert api.default_login().leftover_access is False
+
+    def test_an_mcp_login_renewed_before_the_retry_is_the_one_kept(
+        self, kept, macos, temp_home, monkeypatch
+    ):
+        """Claude Code goes on reading the item after a removal that failed,
+        and may renew an MCP server's login there before the retry; the
+        retry moves that one, not the copy the first try moved."""
+        from claude_swap import macos_keychain
+
+        own = _token_login("sk-own", "rt-own", _in(hours=8))
+        _default_file(temp_home).write_text(json.dumps(own))
+        lent = _token_login("sk-ant-oat01-lent", None, _in(hours=1))
+        older = {"server": {"accessToken": "mcp-1", "refreshToken": "mcp-rt-1"}}
+        macos.set_password(*_default_item(), json.dumps({**lent, "mcpOAuth": older}))
+
+        def busy(service, account):
+            raise macos_keychain.KeychainError("security timed out")
+
+        monkeypatch.setattr(macos_keychain, "delete_password", busy)
+        with pytest.raises(api.CredentialWriteError, match="Keychain"):
+            api.forget_default_access_login()
+        newer = {"server": {"accessToken": "mcp-2", "refreshToken": "mcp-rt-2"}}
+        macos.set_password(*_default_item(), json.dumps({**lent, "mcpOAuth": newer}))
+        monkeypatch.setattr(macos_keychain, "delete_password", macos.delete_password)
+        assert api.forget_default_access_login() is True
+        assert json.loads(_default_file(temp_home).read_text()) == {
+            **own,
+            "mcpOAuth": newer,
+        }
+        assert macos.get_password(*_default_item()) is None
+
+    def test_a_removal_that_went_through_after_all_keeps_what_moved(
+        self, kept, macos, temp_home, monkeypatch
+    ):
+        """``security`` can report a failure after it removed the item (a
+        timeout); the file then keeps what moved, the item's only copy."""
+        from claude_swap import macos_keychain
+
+        own = _token_login("sk-own", "rt-own", _in(hours=8))
+        _default_file(temp_home).write_text(json.dumps(own))
+        mcp = {"server": {"accessToken": "mcp"}}
+        macos.set_password(*_default_item(), json.dumps(
+            {**_token_login("sk-ant-oat01-lent", None, _in(hours=1)), "mcpOAuth": mcp}
+        ))
+
+        def removed_then_timed_out(service, account):
+            macos.delete_password(service, account)
+            raise macos_keychain.KeychainError("security timed out")
+
+        monkeypatch.setattr(macos_keychain, "delete_password", removed_then_timed_out)
+        with pytest.raises(api.CredentialWriteError, match="Keychain"):
+            api.forget_default_access_login()
+        assert macos.get_password(*_default_item()) is None
+        moved = {**own, "mcpOAuth": mcp}
+        assert json.loads(_default_file(temp_home).read_text()) == moved
+        info = api.default_login()
+        assert (info.kind, info.leftover_access) == ("own", False)
 
     def test_an_api_key_with_an_access_token_left(self, kept, linux, temp_home):
         (temp_home / ".claude.json").write_text(
