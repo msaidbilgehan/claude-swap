@@ -9,6 +9,7 @@ the consumer, never just the test.
 from __future__ import annotations
 
 import builtins
+import contextlib
 import inspect
 import json
 import os
@@ -2598,6 +2599,15 @@ def _make_live(seeded, login: dict) -> None:
     (seeded.temp_home / ".claude" / ".credentials.json").write_text(json.dumps(login))
 
 
+def _unlist(seeded, slot: str) -> None:
+    """Take an account off claude-swap's list and leave its stored login, as
+    a removal that finds the macOS Keychain locked leaves it."""
+    data = seeded.switcher._get_sequence_data()
+    del data["accounts"][slot]
+    data["sequence"] = [n for n in data["sequence"] if str(n) != slot]
+    seeded.switcher._write_json(seeded.switcher.sequence_file, data)
+
+
 def _profile_of_account_one(_token: str) -> dict:
     """What Anthropic answers when asked whose a token of account 1 is."""
     return {
@@ -2879,6 +2889,18 @@ class TestAccessToken:
         (aside,) = seeded.switcher.list_unclaimed_credentials().values()
         assert aside["reason"] == "consume-gate-slot-removed"
 
+    def test_a_removal_that_leaves_the_stored_login_behind_gets_no_renewal(
+        self, seeded, endpoint
+    ):
+        due = _token_login("sk-due", "rt-2", _in(minutes=10))
+        _keep_stored(seeded, due)
+        endpoint.during = lambda: _unlist(seeded, "2")
+        info = api.access_token(seeded.switcher, "2", renew_within=900)
+        assert info.renewed is True
+        assert _stored(seeded) == due  # left as the removal left it: spent
+        (aside,) = seeded.switcher.list_unclaimed_credentials().values()
+        assert aside["reason"] == "consume-gate-slot-removed"
+
     def test_a_session_on_an_older_login_does_not_hold_the_new_one(
         self, seeded, endpoint
     ):
@@ -3156,6 +3178,142 @@ class TestAccessTokenOfTheDefaultLogin:
         assert _live(seeded)["claudeAiOauth"]["refreshToken"] == "rt-1-next"
         stored = _stored(seeded, 1, "a@example.com")
         assert stored["claudeAiOauth"]["refreshToken"] == "rt-1-next"
+        assert seeded.switcher.list_unclaimed_credentials() == {}
+
+    @pytest.mark.parametrize("removal", ["whole", "its stored login left behind"])
+    def test_an_account_removed_during_its_renewal_gets_no_stored_login_back(
+        self, seeded, endpoint, removal
+    ):
+        due = _token_login("sk-due", "rt-1", _in(minutes=10))
+        _make_live(seeded, due)
+        _keep_stored(seeded, due, 1, "a@example.com")
+        # removing an account does not wait for claude-swap's lock
+        if removal == "whole":
+            endpoint.during = lambda: api.remove_account(seeded.switcher, "1")
+        else:
+            endpoint.during = lambda: _unlist(seeded, "1")
+        info = api.access_token(seeded.switcher, "1", renew_within=900)
+        assert info.renewed is True
+        if removal == "whole":
+            assert seeded.switcher.read_account_credentials("1", "a@example.com") == ""
+        else:
+            assert _stored(seeded, 1, "a@example.com") == due  # spent, not renewed
+        assert "1" not in seeded.switcher._get_sequence_data()["accounts"]
+        # Claude Code's default profile, still logged in, holds the renewal
+        assert _live(seeded)["claudeAiOauth"]["refreshToken"] == "rt-1-next"
+        assert seeded.switcher.list_unclaimed_credentials() == {}
+
+    def test_a_renewal_of_a_removed_account_the_default_profile_refuses_is_set_aside(
+        self, seeded, endpoint, monkeypatch
+    ):
+        due = _token_login("sk-due", "rt-1", _in(minutes=10))
+        _make_live(seeded, due)
+        _keep_stored(seeded, due, 1, "a@example.com")
+        endpoint.during = lambda: api.remove_account(seeded.switcher, "1")
+
+        def full_disk(*_a):
+            raise OSError(28, "No space left on device")
+
+        monkeypatch.setattr(seeded.switcher, "_write_credentials", full_disk)
+        assert api.access_token(seeded.switcher, "1", renew_within=900).renewed
+        assert seeded.switcher.read_account_credentials("1", "a@example.com") == ""
+        (aside,) = seeded.switcher.list_unclaimed_credentials().values()
+        assert aside["reason"] == "consume-gate-slot-removed"
+
+    def test_a_login_added_again_during_the_renewal_is_kept(self, seeded, endpoint):
+        due = _token_login("sk-due", "rt-1", _in(minutes=10))
+        _make_live(seeded, due)
+        _keep_stored(seeded, due, 1, "a@example.com")
+        added = _token_login("sk-added", "rt-added", _in(hours=8))
+        # adding an account does not wait for claude-swap's lock either
+        endpoint.during = lambda: _keep_stored(seeded, added, 1, "a@example.com")
+        info = api.access_token(seeded.switcher, "1", renew_within=900)
+        assert info.renewed is True
+        assert _stored(seeded, 1, "a@example.com") == added
+        assert _live(seeded)["claudeAiOauth"]["refreshToken"] == "rt-1-next"
+        assert seeded.switcher.list_unclaimed_credentials() == {}
+
+    @pytest.mark.parametrize("moved_on", ["a new login", "an unreadable profile"])
+    def test_a_set_aside_renewal_never_goes_over_what_came_in_between(
+        self, seeded, endpoint, monkeypatch, moved_on
+    ):
+        """A renewal claude-swap set aside goes back into the default profile
+        only while that profile still holds the login it renewed, read again
+        under Claude Code's locks: a ``/login`` that lands after claude-swap
+        read the profile, before those locks, stays. The renewal is the
+        account's stored login then, and is handed out as one."""
+        due = _token_login("sk-due", "rt-1", _in(minutes=10))
+        _make_live(seeded, due)
+        _keep_stored(seeded, due, 1, "a@example.com")
+
+        def full_disk(*_a):
+            raise OSError(28, "No space left on device")
+
+        with monkeypatch.context() as patched:
+            patched.setattr(seeded.switcher, "_write_account_credentials", full_disk)
+            patched.setattr(seeded.switcher, "_write_credentials", full_disk)
+            first = api.access_token(seeded.switcher, "1", renew_within=900)
+        assert len(seeded.switcher.list_unclaimed_credentials()) == 1
+        relogin = _token_login("sk-ant-oat01-relogin", "rt-relogin", _in(hours=8))
+        locks = api._claude_code_locks
+
+        @contextlib.contextmanager
+        def it_lands_first(slot):
+            if moved_on == "a new login":
+                _make_live(seeded, relogin)
+            else:
+                from claude_swap.credentials import ActiveCredentials
+
+                unreadable = ActiveCredentials(json.dumps(due), False, True)
+                monkeypatch.setattr(
+                    seeded.switcher, "_read_active_credentials", lambda: unreadable
+                )
+            with locks(slot):
+                yield
+
+        monkeypatch.setattr(api, "_claude_code_locks", it_lands_first)
+        again = api.access_token(seeded.switcher, "1", renew_within=900)
+        assert _live(seeded) == (relogin if moved_on == "a new login" else due)
+        assert (again.access_token, again.renewed) == (first.access_token, False)
+        stored = _stored(seeded, 1, "a@example.com")
+        assert stored["claudeAiOauth"]["refreshToken"] == "rt-1-next"
+        assert seeded.switcher.list_unclaimed_credentials() == {}
+        assert endpoint.posted == ["rt-1"]
+
+    def test_a_set_aside_renewal_that_is_due_is_renewed_as_the_stored_login(
+        self, seeded, endpoint, monkeypatch
+    ):
+        from claude_swap.oauth import credential_fingerprint
+
+        due = _token_login("sk-due", "rt-1", _in(minutes=-10))
+        _make_live(seeded, due)
+        _keep_stored(seeded, due, 1, "a@example.com")
+        successor = _token_login("sk-ant-oat01-aside", "rt-aside", _in(minutes=5))
+        seeded.switcher._store._write_unclaimed_credential(
+            json.dumps(successor),
+            {
+                "reason": "consume-gate-persist-failed",
+                "configSlot": "1",
+                "consumedFp": credential_fingerprint(json.dumps(due)),
+                "fingerprint": credential_fingerprint(json.dumps(successor)),
+            },
+        )
+        relogin = _token_login("sk-ant-oat01-relogin", "rt-relogin", _in(hours=8))
+        locks = api._claude_code_locks
+
+        @contextlib.contextmanager
+        def a_login_lands_first(slot):
+            _make_live(seeded, relogin)
+            with locks(slot):
+                yield
+
+        monkeypatch.setattr(api, "_claude_code_locks", a_login_lands_first)
+        info = api.access_token(seeded.switcher, "1", renew_within=900)
+        assert endpoint.posted == ["rt-aside"]
+        assert (info.access_token, info.renewed) == ("sk-ant-oat01-renewed-1", True)
+        assert _live(seeded) == relogin
+        stored = _stored(seeded, 1, "a@example.com")
+        assert stored["claudeAiOauth"]["refreshToken"] == "rt-aside-next"
         assert seeded.switcher.list_unclaimed_credentials() == {}
 
     def test_a_lapsed_login_it_cannot_check_says_what_helps(self, seeded, endpoint):

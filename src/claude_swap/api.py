@@ -2243,24 +2243,58 @@ def _set_aside(
     )
 
 
+def _stored_lineage(
+    switcher: ClaudeAccountSwitcher, slot: str, email: str
+) -> str | None:
+    """The fingerprint of the account's stored login; ``None`` when it reads
+    empty or cannot be read now."""
+    stored, unreadable = switcher._read_account_credentials_ex(slot, email)
+    if unreadable or not stored:
+        return None
+    return credential_fingerprint(stored)
+
+
+def _store_moved_on(
+    switcher: ClaudeAccountSwitcher, slot: str, email: str, held: str | None
+) -> str | None:
+    """Why a renewal must not be written to the account's stored login now,
+    read again: adding or removing the account does not wait for
+    claude-swap's lock, so the store may have moved on since ``held`` (the
+    fingerprint of the login it held). The consume gate's reasons for setting
+    a renewal aside: the account left claude-swap's account list or its store
+    reads empty (it was removed; on macOS a removal that finds the Keychain
+    locked leaves the stored login behind), the account list or the store
+    cannot be read, or the store holds another login (the account was added
+    again). ``None`` while it still holds ``held``."""
+    try:
+        accounts = (switcher._get_sequence_data() or {}).get("accounts", {})
+    except ClaudeSwitchError:
+        return _ASIDE_STORE_UNREADABLE
+    if not isinstance(accounts, dict):
+        return _ASIDE_STORE_UNREADABLE
+    if slot not in accounts:
+        return _ASIDE_SLOT_REMOVED
+    now, unreadable = switcher._read_account_credentials_ex(slot, email)
+    if unreadable:
+        return _ASIDE_STORE_UNREADABLE
+    if not now:
+        return _ASIDE_SLOT_REMOVED
+    if held is None or credential_fingerprint(now) != held:
+        return _ASIDE_CAS_CONFLICT
+    return None
+
+
 def _store_renewal(
     switcher: ClaudeAccountSwitcher, slot: str, email: str, consumed: str, renewed: str
 ) -> None:
     """Store a renewal of the account's stored login as the consume gate
-    stores one: only while the store still holds the login it renewed, read
-    again now, since adding or removing the account does not wait for
-    claude-swap's lock (a login added meanwhile stays; a removed one is not
-    brought back). Otherwise, and when the write fails, the renewal is set
+    stores one: only while the store still holds the login it renewed
+    (:func:`_store_moved_on`; a login added meanwhile stays, a removed one is
+    not brought back). Otherwise, and when the write fails, the renewal is set
     aside. Never raises: the old refresh token is spent, and the renewal is
     handed out all the same."""
-    now, unreadable = switcher._read_account_credentials_ex(slot, email)
-    if unreadable:
-        reason = _ASIDE_STORE_UNREADABLE
-    elif not now:
-        reason = _ASIDE_SLOT_REMOVED
-    elif credential_fingerprint(now) != credential_fingerprint(consumed):
-        reason = _ASIDE_CAS_CONFLICT
-    else:
+    reason = _store_moved_on(switcher, slot, email, credential_fingerprint(consumed))
+    if reason is None:
         try:
             switcher._write_account_credentials(slot, email, renewed)
         except (ClaudeSwitchError, OSError) as e:
@@ -2277,23 +2311,39 @@ def _store_renewal(
 
 
 def _store_live_renewal(
-    switcher: ClaudeAccountSwitcher, slot: str, email: str, consumed: str, renewed: str
+    switcher: ClaudeAccountSwitcher,
+    slot: str,
+    email: str,
+    consumed: str,
+    renewed: str,
+    held: str | None,
 ) -> None:
     """Store a renewal of the default profile's login wherever the old login
-    was: the account's stored login and the default profile (Claude Code
-    takes it from there at its next request); set it aside when neither
-    takes it. Never raises: the old refresh token is spent, and the new
-    login is handed out all the same."""
-    stored = True
-    try:
-        switcher._write_account_credentials(slot, email, renewed)
-    except (ClaudeSwitchError, OSError) as e:
-        stored = False
-        _logger.warning(
-            "api: account %s's renewed login could not be kept as its stored "
-            "login: %s",
+    was: the default profile (Claude Code takes it from there at its next
+    request) and the account's stored login, the latter only while the store
+    still holds the login it held before the request (``held``, its
+    fingerprint; :func:`_store_moved_on`): an account removed meanwhile gets
+    no stored login back, and one added again keeps its new login. Set aside
+    when neither takes it. Never raises: the old refresh token is spent, and
+    the new login is handed out all the same."""
+    reason = _store_moved_on(switcher, slot, email, held)
+    if reason is None:
+        try:
+            switcher._write_account_credentials(slot, email, renewed)
+        except (ClaudeSwitchError, OSError) as e:
+            reason = _ASIDE_PERSIST_FAILED
+            _logger.warning(
+                "api: account %s's renewed login could not be kept as its stored "
+                "login: %s",
+                slot,
+                e,
+            )
+    else:
+        _logger.info(
+            "api: account %s's renewed login was not written to its stored login, "
+            "which changed during the renewal (%s)",
             slot,
-            e,
+            reason,
         )
     try:
         with claude_config_lock():
@@ -2305,16 +2355,32 @@ def _store_live_renewal(
             slot,
             e,
         )
-        if not stored:
-            _set_aside(switcher, slot, consumed, renewed, _ASIDE_PERSIST_FAILED)
+        if reason is not None:
+            _set_aside(switcher, slot, consumed, renewed, reason)
 
 
-def _write_live(switcher: ClaudeAccountSwitcher, slot: str, credentials: str) -> None:
+def _write_live(
+    switcher: ClaudeAccountSwitcher, slot: str, renewed_from: str, credentials: str
+) -> bool:
     """Put a renewal of the default profile's login that was set aside back
-    where Claude Code reads it; the caller holds Claude Code's credential
-    locks (:func:`_claude_code_locks`). Best effort: it is the stored login
-    now, and claude-swap restores the default profile from there once Claude
-    Code's copy stops working."""
+    where Claude Code reads it, while the default profile still holds the
+    login it renewed (``renewed_from``), read again now: a ``/login`` that
+    came in between stays. False, with nothing written, when the default
+    profile holds another login or cannot be read cleanly now. The caller
+    holds Claude Code's credential locks (:func:`_claude_code_locks`). The
+    write is best effort: the renewal is the stored login now, and
+    claude-swap restores the default profile from there once Claude Code's
+    copy stops working."""
+    active = switcher._read_active_credentials()
+    if not switcher._read_cleanly(active) or credential_fingerprint(
+        active.value or ""
+    ) != credential_fingerprint(renewed_from):
+        _logger.info(
+            "api: account %s's renewal that was set aside stays out of Claude "
+            "Code's default profile, which no longer holds the login it renewed",
+            slot,
+        )
+        return False
     try:
         with claude_config_lock():
             switcher._write_credentials(credentials)
@@ -2325,6 +2391,7 @@ def _write_live(switcher: ClaudeAccountSwitcher, slot: str, credentials: str) ->
             slot,
             e,
         )
+    return True
 
 
 def _attribute_live(
@@ -2449,14 +2516,15 @@ def _require_own_live(
 
 def _own_live_login(
     switcher: ClaudeAccountSwitcher, slot: str, email: str, org_uuid: str
-) -> tuple[str, bool]:
+) -> tuple[str, str | None]:
     """The login of Claude Code's default profile, which runs on the
-    account, once it is known to be the account's own; and whether it is a
+    account, once it is known to be the account's own, and ``None``; or a
     renewal of that login claude-swap set aside, taken in as the account's
-    stored login but not in the default profile yet. A read that fell back
-    past a failed Keychain read is refused: on macOS Claude Code renews in
-    the Keychain only, so the fallback may be an older login whose access
-    token no longer works. The caller holds :func:`_account_locks`."""
+    stored login but not in the default profile yet, and the default
+    profile's login it renewed. A read that fell back past a failed Keychain
+    read is refused: on macOS Claude Code renews in the Keychain only, so
+    the fallback may be an older login whose access token no longer works.
+    The caller holds :func:`_account_locks`."""
     active = switcher._read_active_credentials()
     if active.value is None or active.degraded or active.keychain_unavailable:
         raise _live_unreadable(slot, email)
@@ -2472,32 +2540,39 @@ def _own_live_login(
         raise refusal
     taken = _take_in_set_aside(switcher, slot, email, live)
     if taken is not None:
-        return taken, True
+        return taken, live
     _require_own_live(switcher, slot, email, live)
-    return live, False
+    return live, None
 
 
 def _live_token(
     switcher: ClaudeAccountSwitcher, slot: str, email: str, org_uuid: str, window_ms: int
-) -> tuple[str, bool]:
+) -> tuple[str, bool] | None:
     """The login of Claude Code's default profile, renewed first when it is
     due, as Claude Code renews it: under Claude Code's credential locks too,
     read again under them (a renewal Claude Code made meanwhile is taken as
     it is). A renewal set aside is put back in the default profile under
-    those locks as well. The caller holds :func:`_account_locks`: no switch
-    and no other renewal of claude-swap's comes in between."""
-    live, set_aside = _own_live_login(switcher, slot, email, org_uuid)
-    if not set_aside and not _due(live, window_ms):
+    those locks as well, while the default profile still holds the login it
+    renewed; ``None`` when it does not (a ``/login`` came in between, or it
+    cannot be read now): the renewal is only the account's stored login
+    then, and the caller serves it as one. The caller holds
+    :func:`_account_locks`: no switch and no other renewal of claude-swap's
+    comes in between."""
+    live, renewed_from = _own_live_login(switcher, slot, email, org_uuid)
+    if renewed_from is None and not _due(live, window_ms):
         return live, False
     with _claude_code_locks(slot):
-        if not set_aside:
-            live, set_aside = _own_live_login(switcher, slot, email, org_uuid)
-        if set_aside:
-            _write_live(switcher, slot, live)
+        if renewed_from is None:
+            live, renewed_from = _own_live_login(switcher, slot, email, org_uuid)
+        if renewed_from is not None and not _write_live(
+            switcher, slot, renewed_from, live
+        ):
+            return None
         if not _due(live, window_ms):
             return live, False
         if _session_holds(switcher, slot, email, org_uuid, live):
             raise _session_renews_it(slot, email)
+        held = _stored_lineage(switcher, slot, email)
         result = oauth.try_refresh_oauth_credentials(
             live, timeout_s=_LOCKED_RENEWAL_TIMEOUT
         )
@@ -2507,7 +2582,7 @@ def _live_token(
         switcher._probe_verdicts[
             switcher._lineage_key(slot, email, credential_fingerprint(renewed) or "")
         ] = True
-        _store_live_renewal(switcher, slot, email, live, renewed)
+        _store_live_renewal(switcher, slot, email, live, renewed, held)
     return renewed, True
 
 
@@ -2633,11 +2708,16 @@ def access_token(
     the way claude-swap and Claude Code renew it here, so no copy on this
     computer is left with a spent refresh token: the default profile's login
     under Claude Code's own credential locks as well, written back to the
-    default profile and the stored login; a stored login written back to
-    the store while it still holds the login renewed, as claude-swap's
-    consume gate writes one (a login added or removed meanwhile is left as
-    it is). A renewal that is not stored is set aside, and the next call
-    takes it in. A login renewed meanwhile is taken as it is. A login
+    default profile, and to the stored login while the store still holds
+    the login it held before; a stored login written back to the store while
+    it still holds the login renewed, as claude-swap's consume gate writes
+    one. Either way an account removed meanwhile gets no stored login back,
+    and one added again keeps its new login. A renewal that is not stored is
+    set aside, and the next call takes it in; a renewal of the default
+    profile's login goes back there only while the default profile still
+    holds the login it renewed (a ``/login`` meanwhile stays), and is served
+    as the stored login otherwise. A login renewed meanwhile is taken as it
+    is. A login
     is not renewed while a Claude session runs on it in the account's
     ``cswap run`` profile (that session holds the same refresh token and
     renews it itself the next time it is used); a session on another login
@@ -2674,10 +2754,12 @@ def access_token(
         # A default login another computer lent (sak.13) is not this
         # account's login here: the stored login is the newest one then.
         live = switcher._live_identity_matches(email, org_uuid)
+        token = None
         if live and not switcher._live_login_is_lent():
-            login, renewed = _live_token(switcher, slot, email, org_uuid, window_ms)
-        else:
-            login, renewed = _stored_token(switcher, slot, email, org_uuid, window_ms)
+            token = _live_token(switcher, slot, email, org_uuid, window_ms)
+        if token is None:
+            token = _stored_token(switcher, slot, email, org_uuid, window_ms)
+        login, renewed = token
     return _token_info(slot, email, org_uuid, record, login, renewed)
 
 
