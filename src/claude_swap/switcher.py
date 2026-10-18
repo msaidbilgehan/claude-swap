@@ -6976,6 +6976,65 @@ class ClaudeAccountSwitcher:
         )
         return entry_id
 
+    def _back_up_replaced_login(self, live: str, provenance: dict) -> str | None:
+        """Keep the active account's live login before a login that is none
+        of claude-swap's accounts replaces it (sak.14:
+        ``api.use_access_login(..., replace_own=True)``), as step 1 of
+        :meth:`_perform_switch` keeps it when a switch leaves the account.
+
+        A rotation of the slot's login, a lineage the profile endpoint
+        resolved to the account, or one it could not resolve goes into the
+        slot with the config; the slot's very bytes, or an emptied login,
+        refresh the config only; one proven to be another account's is kept
+        in a safety copy and written into no slot; one another computer lent,
+        or one the other account's slot holds already, is written nowhere.
+        The account stays, and ``cswap switch`` goes back to it.
+
+        ``live`` is the login Claude Code reads now and ``provenance`` what
+        :meth:`_prefetch_live_identity` resolved before the locks were taken.
+        The caller holds ``self.lock_file`` and Claude Code's credential and
+        config locks. Returns how the live login was classified
+        (:meth:`_classify_outgoing_credential`); ``None`` when no account of
+        claude-swap's is live. Prints nothing.
+        """
+        data = self._get_sequence_data() or {}
+        identity = self._get_current_account()
+        if identity is None:
+            return None
+        email, org_uuid = identity
+        slot = self._find_account_slot(data, email, org_uuid)
+        if slot is None:
+            return None
+        config_path = self._get_claude_config_path()
+        try:
+            config = config_path.read_text(encoding="utf-8")
+        except OSError as e:
+            raise ConfigError(f"Cannot read {config_path} now: {e}") from e
+        kind, _ = self._classify_outgoing_credential(
+            slot, email, live, provenance, data
+        )
+        if kind in ("foreign", "alien", "known-foreign"):
+            self._stash_live_credential(
+                live, kind, slot, provenance.get("resolved")
+            )
+        elif kind in ("unresolved", "own-family", "own-rotated"):
+            self._write_account_credentials(slot, email, live)
+            self._write_account_config(slot, email, config)
+        elif kind in ("own-bytes", "wiped"):
+            self._write_account_config(slot, email, config)
+        # "foreign-synced" and "lent": nothing is written, as in a switch.
+        resolved = provenance.get("resolved") or {}
+        account = data.get("accounts", {}).get(slot, {})
+        if kind == "own-rotated" and not account.get("uuid") and resolved.get("uuid"):
+            account["uuid"] = resolved["uuid"]
+            data["lastUpdated"] = get_timestamp()
+            self._write_json(self.sequence_file, data)
+        self._logger.info(
+            f"Kept account {slot}'s live login ({kind}) before another computer's "
+            "access replaced it"
+        )
+        return kind
+
     def _read_target_credentials(self, account_num: str, email: str) -> str:
         """The switch target's stored credential, or a SwitchError naming why.
 
