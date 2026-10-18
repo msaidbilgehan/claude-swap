@@ -3349,6 +3349,51 @@ class TestAccessTokenOfTheDefaultLogin:
         assert "pluginSecrets" not in live
         assert seeded.switcher.list_unclaimed_credentials() == {}
 
+    def test_a_renewal_keeps_the_shared_keys_saved_during_its_request(
+        self, seeded, endpoint
+    ):
+        """Claude Code saves an MCP server's login under its storage-write lock,
+        which a renewal does not hold, so one can land during the renewal's
+        request. The renewal goes into the default profile with the shared keys
+        the profile holds then, as a switch takes them."""
+        due = _token_login("sk-due", "rt-1", _in(minutes=10))
+        older = {"server": {"accessToken": "mcp-1", "refreshToken": "mcp-rt-1"}}
+        plugins = {"plugin": {"key": "secret"}}
+        _make_live(seeded, {**due, "mcpOAuth": older, "pluginSecrets": plugins})
+        _keep_stored(seeded, due, 1, "a@example.com")
+        newer = {"server": {"accessToken": "mcp-2", "refreshToken": "mcp-rt-2"}}
+        endpoint.during = lambda: _make_live(seeded, {**due, "mcpOAuth": newer})
+        info = api.access_token(seeded.switcher, "1", renew_within=900)
+        assert (info.access_token, info.renewed) == ("sk-ant-oat01-renewed-1", True)
+        live = _live(seeded)
+        assert live["claudeAiOauth"]["refreshToken"] == "rt-1-next"
+        assert live["mcpOAuth"] == newer
+        assert "pluginSecrets" not in live
+        stored = _stored(seeded, 1, "a@example.com")
+        assert stored["claudeAiOauth"]["refreshToken"] == "rt-1-next"
+
+    def test_a_read_that_is_not_clean_gives_a_renewal_no_shared_keys(
+        self, seeded, endpoint, monkeypatch
+    ):
+        """After a failed Keychain read the bytes served may be a stale file's,
+        so the renewal keeps the shared keys it was renewed with."""
+        from claude_swap.credentials import ActiveCredentials
+
+        due = _token_login("sk-due", "rt-1", _in(minutes=10))
+        current = {"server": {"accessToken": "mcp-1", "refreshToken": "mcp-rt-1"}}
+        _make_live(seeded, {**due, "mcpOAuth": current})
+        _keep_stored(seeded, due, 1, "a@example.com")
+        stale = {"server": {"accessToken": "mcp-0", "refreshToken": "mcp-rt-0"}}
+        stale_bytes = json.dumps({**due, "mcpOAuth": stale})
+        degraded = ActiveCredentials(stale_bytes, False, True)
+        endpoint.during = lambda: monkeypatch.setattr(
+            seeded.switcher, "_read_active_credentials", lambda: degraded
+        )
+        assert api.access_token(seeded.switcher, "1", renew_within=900).renewed
+        live = _live(seeded)
+        assert live["claudeAiOauth"]["refreshToken"] == "rt-1-next"
+        assert live["mcpOAuth"] == current
+
     def test_a_lapsed_login_it_cannot_check_says_what_helps(self, seeded, endpoint):
         _keep_stored(
             seeded, _token_login("sk-s", "rt-s", _in(hours=-3)), 1, "a@example.com"

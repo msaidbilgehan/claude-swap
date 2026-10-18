@@ -77,6 +77,7 @@ from claude_swap.credentials import (
     CLAUDE_CODE_KEYCHAIN_SERVICE,
     CLAUDE_CODE_MANAGED_KEYCHAIN_SERVICE,
     SHARED_CREDENTIAL_KEYS,
+    ActiveCredentials,
     CredentialStore,
     looks_like_api_key,
 )
@@ -2324,9 +2325,12 @@ def _store_live_renewal(
     request) and the account's stored login, the latter only while the store
     still holds the login it held before the request (``held``, its
     fingerprint; :func:`_store_moved_on`): an account removed meanwhile gets
-    no stored login back, and one added again keeps its new login. Set aside
-    when neither takes it. Never raises: the old refresh token is spent, and
-    the new login is handed out all the same."""
+    no stored login back, and one added again keeps its new login. The
+    default profile's copy takes the machine-shared keys the profile holds
+    just before that write (:func:`_with_shared_keys_of`): Claude Code may
+    save an MCP server's login during the request. Set aside when neither
+    takes it. Never raises: the old refresh token is spent, and the new
+    login is handed out all the same."""
     reason = _store_moved_on(switcher, slot, email, held)
     if reason is None:
         try:
@@ -2348,7 +2352,11 @@ def _store_live_renewal(
         )
     try:
         with claude_config_lock():
-            switcher._write_credentials(renewed)
+            switcher._write_credentials(
+                _with_shared_keys_of(
+                    switcher, renewed, switcher._read_active_credentials()
+                )
+            )
     except (ClaudeSwitchError, OSError) as e:
         _logger.warning(
             "api: account %s's renewed login could not be written to Claude "
@@ -2360,6 +2368,20 @@ def _store_live_renewal(
             _set_aside(switcher, slot, consumed, renewed, reason)
 
 
+def _with_shared_keys_of(
+    switcher: ClaudeAccountSwitcher, credentials: str, active: ActiveCredentials
+) -> str:
+    """``credentials`` with the machine-shared keys (``SHARED_CREDENTIAL_KEYS``:
+    MCP server logins, plugin secrets) of ``active``, a read of the default
+    profile just before ``credentials`` are written there, taken as a switch
+    takes them: what the profile holds then wins, and a key it dropped stays
+    dropped. Unchanged when that read is not clean: its bytes may then be a
+    stale file's."""
+    if not switcher._read_cleanly(active):
+        return credentials
+    return switcher._prepare_credentials_for_activation(credentials, active.value)
+
+
 def _write_live(
     switcher: ClaudeAccountSwitcher, slot: str, renewed_from: str, credentials: str
 ) -> bool:
@@ -2367,9 +2389,9 @@ def _write_live(
     where Claude Code reads it, while the default profile still holds the
     login it renewed (``renewed_from``), read again now: a ``/login`` that
     came in between stays. The machine-shared keys come from the default
-    profile as it is now, as a switch takes them: an MCP server's login
-    Claude Code renewed since the renewal was set aside wins over the copy
-    the renewal carries. False, with nothing written, when the default
+    profile as it is now (:func:`_with_shared_keys_of`): an MCP server's
+    login Claude Code renewed since the renewal was set aside wins over the
+    copy the renewal carries. False, with nothing written, when the default
     profile holds another login or cannot be read cleanly now. The caller
     holds Claude Code's credential locks (:func:`_claude_code_locks`). The
     write is best effort: the renewal is the stored login now, and
@@ -2388,7 +2410,7 @@ def _write_live(
     try:
         with claude_config_lock():
             switcher._write_credentials(
-                switcher._prepare_credentials_for_activation(credentials, active.value)
+                _with_shared_keys_of(switcher, credentials, active)
             )
     except (ClaudeSwitchError, OSError) as e:
         _logger.warning(
@@ -2721,10 +2743,11 @@ def access_token(
     and one added again keeps its new login. A renewal that is not stored is
     set aside, and the next call takes it in; a renewal of the default
     profile's login goes back there only while the default profile still
-    holds the login it renewed (a ``/login`` meanwhile stays), with the
-    machine-shared keys the profile holds then (an MCP server's login
-    renewed meanwhile wins), and is served as the stored login otherwise. A
-    login renewed meanwhile is taken as it is. A login
+    holds the login it renewed (a ``/login`` meanwhile stays), and is served
+    as the stored login otherwise. What goes into the default profile takes
+    the machine-shared keys the profile holds just before the write, as a
+    switch takes them, so an MCP server's login Claude Code saved meanwhile
+    wins. A login renewed meanwhile is taken as it is. A login
     is not renewed while a Claude session runs on it in the account's
     ``cswap run`` profile (that session holds the same refresh token and
     renews it itself the next time it is used); a session on another login
