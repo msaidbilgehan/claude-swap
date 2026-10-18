@@ -2366,7 +2366,10 @@ def _write_live(
     """Put a renewal of the default profile's login that was set aside back
     where Claude Code reads it, while the default profile still holds the
     login it renewed (``renewed_from``), read again now: a ``/login`` that
-    came in between stays. False, with nothing written, when the default
+    came in between stays. The machine-shared keys come from the default
+    profile as it is now, as a switch takes them: an MCP server's login
+    Claude Code renewed since the renewal was set aside wins over the copy
+    the renewal carries. False, with nothing written, when the default
     profile holds another login or cannot be read cleanly now. The caller
     holds Claude Code's credential locks (:func:`_claude_code_locks`). The
     write is best effort: the renewal is the stored login now, and
@@ -2384,7 +2387,9 @@ def _write_live(
         return False
     try:
         with claude_config_lock():
-            switcher._write_credentials(credentials)
+            switcher._write_credentials(
+                switcher._prepare_credentials_for_activation(credentials, active.value)
+            )
     except (ClaudeSwitchError, OSError) as e:
         _logger.warning(
             "api: account %s's login that was set aside could not be written to "
@@ -2716,9 +2721,10 @@ def access_token(
     and one added again keeps its new login. A renewal that is not stored is
     set aside, and the next call takes it in; a renewal of the default
     profile's login goes back there only while the default profile still
-    holds the login it renewed (a ``/login`` meanwhile stays), and is served
-    as the stored login otherwise. A login renewed meanwhile is taken as it
-    is. A login
+    holds the login it renewed (a ``/login`` meanwhile stays), with the
+    machine-shared keys the profile holds then (an MCP server's login
+    renewed meanwhile wins), and is served as the stored login otherwise. A
+    login renewed meanwhile is taken as it is. A login
     is not renewed while a Claude session runs on it in the account's
     ``cswap run`` profile (that session holds the same refresh token and
     renews it itself the next time it is used); a session on another login

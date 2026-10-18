@@ -3316,6 +3316,39 @@ class TestAccessTokenOfTheDefaultLogin:
         assert stored["claudeAiOauth"]["refreshToken"] == "rt-aside-next"
         assert seeded.switcher.list_unclaimed_credentials() == {}
 
+    def test_a_set_aside_renewal_goes_back_with_the_shared_keys_of_now(
+        self, seeded, endpoint, monkeypatch
+    ):
+        """A renewal claude-swap set aside carries the machine-shared keys the
+        default profile held when it was renewed. Going back there it takes
+        the ones the profile holds now, as a switch does: an MCP server's
+        login Claude Code renewed meanwhile wins, and a key it dropped stays
+        dropped."""
+        due = _token_login("sk-due", "rt-1", _in(minutes=10))
+        older = {"server": {"accessToken": "mcp-1", "refreshToken": "mcp-rt-1"}}
+        plugins = {"plugin": {"key": "secret"}}
+        _make_live(seeded, {**due, "mcpOAuth": older, "pluginSecrets": plugins})
+        _keep_stored(seeded, due, 1, "a@example.com")
+
+        def full_disk(*_a):
+            raise OSError(28, "No space left on device")
+
+        with monkeypatch.context() as patched:
+            patched.setattr(seeded.switcher, "_write_account_credentials", full_disk)
+            patched.setattr(seeded.switcher, "_write_credentials", full_disk)
+            first = api.access_token(seeded.switcher, "1", renew_within=900)
+        assert len(seeded.switcher.list_unclaimed_credentials()) == 1
+        # Claude Code renews the MCP server's login and drops the plugin's
+        newer = {"server": {"accessToken": "mcp-2", "refreshToken": "mcp-rt-2"}}
+        _make_live(seeded, {**due, "mcpOAuth": newer})
+        again = api.access_token(seeded.switcher, "1", renew_within=900)
+        assert (again.access_token, again.renewed) == (first.access_token, False)
+        live = _live(seeded)
+        assert live["claudeAiOauth"]["refreshToken"] == "rt-1-next"
+        assert live["mcpOAuth"] == newer
+        assert "pluginSecrets" not in live
+        assert seeded.switcher.list_unclaimed_credentials() == {}
+
     def test_a_lapsed_login_it_cannot_check_says_what_helps(self, seeded, endpoint):
         _keep_stored(
             seeded, _token_login("sk-s", "rt-s", _in(hours=-3)), 1, "a@example.com"
